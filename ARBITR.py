@@ -36,6 +36,9 @@ CHANNEL_SIGNALS_ID = -1004368321305
 REQUIRED_CHANNEL_ID = "@arbitrnewwws"
 ADMIN_IDS = [8066395175]
 
+# Зафиксированный юзернейм поддержки (без возможности изменения через админку)
+SUPPORT_USERNAME = "piki_wor"
+
 PRICES = {
     "week": {"usd": 7.0, "days": 7, "name": "PRO (7 дней)"},
     "month": {"usd": 30.0, "days": 30, "name": "VIP (30 дней)"}
@@ -92,7 +95,6 @@ db_mgr = DatabaseManager(DB_NAME)
 
 
 class Form(StatesGroup):
-    waiting_for_support = State()
     waiting_for_broadcast = State()
     waiting_for_grant_id = State()
     waiting_for_grant_days = State()
@@ -106,13 +108,6 @@ class Form(StatesGroup):
 
 
 # --- Вспомогательные функции ---
-def clean_support_username(raw: str) -> str:
-    if not raw:
-        return "support_arbitrage"
-    raw = str(raw).strip()
-    raw = raw.replace("https://t.me/", "").replace("t.me/", "").replace("@", "")
-    return raw or "support_arbitrage"
-
 def parse_expiry(val) -> int:
     if not val:
         return 0
@@ -178,12 +173,6 @@ async def init_db():
         )
     """)
     await db.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    await db.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -194,17 +183,15 @@ async def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support_username', 'support_arbitrage')")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS promo_activations (
+            user_id INTEGER,
+            code TEXT,
+            activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, code)
+        )
+    """)
     await db.commit()
-
-async def get_setting(key: str, default: str = "") -> str:
-    async with db_mgr.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
-        row = await cursor.fetchone()
-        return row[0] if row and row[0] is not None else default
-
-async def set_setting(key: str, value: str):
-    await db_mgr.conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
-    await db_mgr.conn.commit()
 
 async def get_sub_expiry(user_id: int) -> int:
     async with db_mgr.conn.execute("SELECT sub_expiry FROM users WHERE user_id = ?", (user_id,)) as cursor:
@@ -356,7 +343,7 @@ class CryptoPayAPI:
 crypto_pay = CryptoPayAPI(CRYPTO_PAY_TOKEN)
 
 
-# --- Сканер рынка ---
+# --- Сканер рынка (ФИЛЬТРАЦИЯ ФАНТОМОВ ВЕСЬМА ЖЁСТКАЯ) ---
 async def fetch_exchange_tickers(ex_name: str, ex_obj) -> Optional[Dict]:
     try:
         tickers = await asyncio.wait_for(ex_obj.fetch_tickers(), timeout=6.0)
@@ -395,13 +382,17 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
             if not bid or not ask or bid <= 0 or ask <= 0:
                 continue
 
-            quote_volume = t.get('quoteVolume') or (t.get('baseVolume', 0) * ask)
-            if quote_volume and quote_volume < 10000.0:
+            # Исключаем аномалии цен и неликвидные монеты
+            quote_volume = t.get('quoteVolume') or ((t.get('baseVolume') or 0) * ask)
+            if not quote_volume or quote_volume < 50000.0:  # Строгий фильтр объема от $50,000 USDT
                 continue
 
-            bid_vol = t.get('bidVolume', 1.0)
-            ask_vol = t.get('askVolume', 1.0)
-            if (bid_vol is not None and bid_vol <= 0) or (ask_vol is not None and ask_vol <= 0):
+            bid_vol = t.get('bidVolume')
+            ask_vol = t.get('askVolume')
+            # Фильтр глубины стакана (объем ордеров не менее $50 USDT)
+            if bid_vol is not None and (bid_vol * bid) < 50.0:
+                continue
+            if ask_vol is not None and (ask_vol * ask) < 50.0:
                 continue
 
             if symbol not in coin_map:
@@ -422,13 +413,15 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
             buy_p = min_ask['ask']
             sell_p = max_bid['bid']
 
-            if buy_p <= 0:
+            if buy_p <= 0 or sell_p <= buy_p:
                 continue
 
             gross = ((sell_p - buy_p) / buy_p) * 100
-            net = gross - 0.20
+            net = gross - 0.20  # Минус комиссии двух бирж
 
-            if 0.3 <= net <= 15.0:
+            # Спред выше 8.0% на споте крупных бирж — 100% фантом (закрыт ввод/вывод).
+            # Фильтруем строгим диапазоном реалистичных аномалий 0.3% - 8.0%
+            if 0.3 <= net <= 8.0:
                 signals.append({
                     'symbol': symbol,
                     'buy_ex': best_buy_ex.upper(),
@@ -458,12 +451,13 @@ async def background_scanner_5s(bot: Bot, exchanges: Dict):
                 symbol = sig['symbol']
                 if sig['net_spread'] >= 0.50 and (now_ts - LAST_ALERT_TIMES.get(symbol, 0) > 180):
                     LAST_ALERT_TIMES[symbol] = now_ts
-                    profit_1k = round((1000 * (sig['net_spread'] / 100)), 2)
+                    # Расчет профита теперь с $100!
+                    profit_100 = round((100 * (sig['net_spread'] / 100)), 2)
                     text = (
                         f"<b>Сигнал: {sig['symbol']}</b> (+{sig['net_spread']}%)\n\n"
                         f"• Покупка: <a href='{sig['buy_url']}'>{sig['buy_ex']}</a> — <code>{sig['buy_price']:.5f}</code>\n"
                         f"• Продажа: <a href='{sig['sell_url']}'>{sig['sell_ex']}</a> — <code>{sig['sell_price']:.5f}</code>\n"
-                        f"• Ож. профит ($1,000): <code>+${profit_1k} USDT</code>\n"
+                        f"• Ож. профит ($100): <code>+${profit_100} USDT</code>\n"
                         f"• Время: {sig['time']} UTC"
                     )
                     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -550,7 +544,6 @@ async def check_channel_sub(user_id: int) -> bool:
 
 async def get_main_menu_kb(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
     has_sub = await is_user_subscribed(user_id)
-    support_user = clean_support_username(await get_setting("support_username", "support_arbitrage"))
 
     btns = []
     if has_sub:
@@ -567,7 +560,7 @@ async def get_main_menu_kb(user_id: int, is_admin: bool = False) -> InlineKeyboa
     ])
     btns.append([
         InlineKeyboardButton(text="📖 Инструкция", callback_data="menu_guide"),
-        InlineKeyboardButton(text="👨‍‍💻 Поддержка", url=f"https://t.me/{support_user}")
+        InlineKeyboardButton(text="👨‍💻 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")
     ])
 
     if is_admin:
@@ -603,6 +596,36 @@ async def cmd_start(message: Message):
         "Выберите интересующий раздел:"
     )
     await message.answer(text, reply_markup=kb)
+
+# --- Промокод /free1 ---
+@router.message(Command("free1"))
+async def cmd_promo_free1(message: Message):
+    user_id = message.from_user.id
+    code = "free1"
+    db = db_mgr.conn
+
+    await update_user(user_id, message.from_user.username or "User")
+
+    async with db.execute("SELECT 1 FROM promo_activations WHERE user_id = ? AND code = ?", (user_id, code)) as cursor:
+        already_used = await cursor.fetchone()
+
+    if already_used:
+        await message.answer("❌ Вы уже активировали данный промокод!")
+        return
+
+    new_exp = await add_subscription(user_id, 3)
+    await db.execute("INSERT INTO promo_activations (user_id, code) VALUES (?, ?)", (user_id, code))
+    await db.commit()
+
+    exp_str = datetime.fromtimestamp(new_exp, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
+    is_admin = user_id in ADMIN_IDS
+    kb = await get_main_menu_kb(user_id, is_admin)
+    await message.answer(
+        f"🎉 <b>Промокод успешно активирован!</b>\n\n"
+        f"Вам выдана PRO-подписка на 3 дня.\n"
+        f"Действует до: <code>{exp_str}</code>",
+        reply_markup=kb
+    )
 
 @router.callback_query(F.data == "menu_main")
 async def cb_menu_main(call: CallbackQuery, state: FSMContext):
@@ -1044,7 +1067,7 @@ async def cb_select_plan(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb)
 
 
-# --- Панель администратора (ИСПРАВЛЕНО) ---
+# --- Панель администратора (ПОЛНОСТЬЮ ИСПРАВЛЕНА) ---
 @router.callback_query(F.data == "menu_admin")
 async def cb_admin_panel(call: CallbackQuery, state: FSMContext):
     if call.from_user.id not in ADMIN_IDS:
@@ -1052,30 +1075,31 @@ async def cb_admin_panel(call: CallbackQuery, state: FSMContext):
         return
 
     await state.clear()
-    support_raw = await get_setting("support_username", "support_arbitrage")
-    support_clean = clean_support_username(support_raw)
     now_ts = int(time.time())
-    
     db = db_mgr.conn
     
-    async with db.execute("SELECT COUNT(*) FROM users") as c1:
-        row1 = await c1.fetchone()
-        total_users = row1[0] if row1 else 0
+    try:
+        async with db.execute("SELECT COUNT(*) FROM users") as c1:
+            row1 = await c1.fetchone()
+            total_users = row1[0] if row1 else 0
 
-    async with db.execute("SELECT COUNT(*) FROM users WHERE sub_expiry > ?", (now_ts,)) as c2:
-        row2 = await c2.fetchone()
-        active_subs = row2[0] if row2 else 0
+        async with db.execute("SELECT COUNT(*) FROM users WHERE sub_expiry > ?", (now_ts,)) as c2:
+            row2 = await c2.fetchone()
+            active_subs = row2[0] if row2 else 0
 
-    async with db.execute("SELECT COALESCE(SUM(amount), 0.0) FROM invoices WHERE status = 'paid'") as c3:
-        row3 = await c3.fetchone()
-        total_revenue = row3[0] if row3 and row3[0] is not None else 0.0
+        async with db.execute("SELECT COALESCE(SUM(amount), 0.0) FROM invoices WHERE status = 'paid'") as c3:
+            row3 = await c3.fetchone()
+            total_revenue = row3[0] if row3 and row3[0] is not None else 0.0
+    except Exception as e:
+        logging.error(f"Admin SQL error: {e}")
+        total_users, active_subs, total_revenue = 0, 0, 0.0
 
     text = (
         f"<b>Панель администратора</b>\n\n"
         f"• Пользователей: {total_users}\n"
         f"• Активных PRO: {active_subs}\n"
         f"• Общий доход: ${total_revenue:.2f} USDT\n"
-        f"• Поддержка: @{support_clean}\n\n"
+        f"• Поддержка: @{SUPPORT_USERNAME}\n\n"
         f"Выберите действие:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1084,29 +1108,14 @@ async def cb_admin_panel(call: CallbackQuery, state: FSMContext):
             InlineKeyboardButton(text="Снять PRO", callback_data="admin_revoke")
         ],
         [InlineKeyboardButton(text="Рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="Изменить юзернейм поддержки", callback_data="admin_change_support")],
         [InlineKeyboardButton(text="Экспорт базы (CSV)", callback_data="admin_export")],
         [InlineKeyboardButton(text="Главное меню", callback_data="menu_main")]
     ])
-    await call.message.edit_text(text, reply_markup=kb)
-
-@router.callback_query(F.data == "admin_change_support")
-async def cb_admin_change_sup(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in ADMIN_IDS:
-        return
-    await state.set_state(Form.waiting_for_support)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu_admin")]])
-    await call.message.edit_text("Укажите новый юзернейм аккаунта поддержки:", reply_markup=kb)
-
-@router.message(Form.waiting_for_support)
-async def process_support_set(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    txt = clean_support_username(message.text)
-    await set_setting("support_username", txt)
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="В админку", callback_data="menu_admin")]])
-    await message.answer(f"Юзернейм поддержки изменен на: @{html.escape(txt)}", reply_markup=kb)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
 
 @router.callback_query(F.data == "admin_grant")
 async def cb_admin_grant_start(call: CallbackQuery, state: FSMContext):

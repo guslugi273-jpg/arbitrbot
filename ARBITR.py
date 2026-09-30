@@ -46,7 +46,7 @@ EXCHANGE_CLASSES = {
     'binance': ccxt.binance,
     'bybit': ccxt.bybit,
     'okx': ccxt.okx,
-    'gate': ccxt.gateio,
+    'gate': ccxt.gate,
     'kucoin': ccxt.kucoin,
 }
 

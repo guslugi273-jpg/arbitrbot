@@ -109,7 +109,7 @@ class Form(StatesGroup):
 def clean_support_username(raw: str) -> str:
     if not raw:
         return "support_arbitrage"
-    raw = raw.strip()
+    raw = str(raw).strip()
     raw = raw.replace("https://t.me/", "").replace("t.me/", "").replace("@", "")
     return raw or "support_arbitrage"
 
@@ -160,7 +160,6 @@ async def init_db():
             enabled_exchanges TEXT DEFAULT '["binance","bybit","okx","gate","kucoin"]'
         )
     """)
-    # Мягкая миграция для существующих БД
     for col, col_type in [("balance", "REAL DEFAULT 50.0"), ("max_deal_amount", "REAL DEFAULT 0.0")]:
         try:
             await db.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
@@ -201,7 +200,7 @@ async def init_db():
 async def get_setting(key: str, default: str = "") -> str:
     async with db_mgr.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
         row = await cursor.fetchone()
-        return row[0] if row else default
+        return row[0] if row and row[0] is not None else default
 
 async def set_setting(key: str, value: str):
     await db_mgr.conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
@@ -219,12 +218,16 @@ async def get_user_data(user_id: int) -> dict:
     ) as cursor:
         row = await cursor.fetchone()
         if row:
+            try:
+                exchanges = json.loads(row[4]) if row[4] else EXCHANGE_NAMES
+            except Exception:
+                exchanges = EXCHANGE_NAMES
             return {
                 "user_id": row[0],
-                "username": row[1],
+                "username": row[1] or "User",
                 "sub_expiry": parse_expiry(row[2]),
                 "min_spread": row[3] if row[3] is not None else 0.3,
-                "exchanges": json.loads(row[4]) if row[4] else EXCHANGE_NAMES,
+                "exchanges": exchanges,
                 "balance": row[5] if row[5] is not None else 50.0,
                 "max_deal_amount": row[6] if row[6] is not None else 0.0,
             }
@@ -295,10 +298,10 @@ async def get_user_trade_stats(user_id: int) -> dict:
     """, (user_id,)) as cursor:
         row = await cursor.fetchone()
         return {
-            "count": row[0],
-            "total_volume": round(row[1], 2),
-            "total_profit": round(row[2], 2),
-            "avg_roi": round(row[3], 2)
+            "count": row[0] if row else 0,
+            "total_volume": round(row[1], 2) if row else 0.0,
+            "total_profit": round(row[2], 2) if row else 0.0,
+            "avg_roi": round(row[3], 2) if row else 0.0
         }
 
 async def get_recent_trades(user_id: int, limit: int = 5) -> list:
@@ -353,7 +356,7 @@ class CryptoPayAPI:
 crypto_pay = CryptoPayAPI(CRYPTO_PAY_TOKEN)
 
 
-# --- Рыночный сканер с глубоким фильтром ложных сигналов ---
+# --- Сканер рынка ---
 async def fetch_exchange_tickers(ex_name: str, ex_obj) -> Optional[Dict]:
     try:
         tickers = await asyncio.wait_for(ex_obj.fetch_tickers(), timeout=6.0)
@@ -376,8 +379,10 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
 
     coin_map = {}
     for ex_name, tickers in all_tickers.items():
+        if not isinstance(tickers, dict):
+            continue
         for symbol, t in tickers.items():
-            if not symbol.endswith('/USDT'):
+            if not symbol or not symbol.endswith('/USDT'):
                 continue
             
             base_coin = symbol.split('/')[0].upper()
@@ -387,16 +392,13 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
             bid = t.get('bid')
             ask = t.get('ask')
             
-            # ФИЛЬТР 1: Проверка на нулевой стакан / отсутствие цен
             if not bid or not ask or bid <= 0 or ask <= 0:
                 continue
 
-            # ФИЛЬТР 2: Проверка суточного объёма (исключаем мертвые токены без ликвидности, < $10,000)
             quote_volume = t.get('quoteVolume') or (t.get('baseVolume', 0) * ask)
             if quote_volume and quote_volume < 10000.0:
                 continue
 
-            # ФИЛЬТР 3: Проверка наличия объема на покупку/продажу
             bid_vol = t.get('bidVolume', 1.0)
             ask_vol = t.get('askVolume', 1.0)
             if (bid_vol is not None and bid_vol <= 0) or (ask_vol is not None and ask_vol <= 0):
@@ -424,11 +426,8 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
                 continue
 
             gross = ((sell_p - buy_p) / buy_p) * 100
-            net = gross - 0.20  # Комиссия бирж 0.1% + 0.1%
+            net = gross - 0.20
 
-            # ФИЛЬТР 4: Исключаем фантомный спред!
-            # Реальный межбиржевой арбитраж лежит в пределах 0.3% - 15.0%.
-            # Все что выше 15% — это закрытый ввод/вывод на бирже, разница в сетях или аномальный фантом.
             if 0.3 <= net <= 15.0:
                 signals.append({
                     'symbol': symbol,
@@ -440,7 +439,7 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
                     'sell_url': get_trade_url(best_sell_ex, symbol),
                     'gross_spread': round(gross, 2),
                     'net_spread': round(net, 2),
-                    'min_required': 10.0, # Минимальный ордер на биржах ($10)
+                    'min_required': 10.0,
                     'time': now_utc
                 })
 
@@ -568,7 +567,7 @@ async def get_main_menu_kb(user_id: int, is_admin: bool = False) -> InlineKeyboa
     ])
     btns.append([
         InlineKeyboardButton(text="📖 Инструкция", callback_data="menu_guide"),
-        InlineKeyboardButton(text="👨‍💻 Поддержка", url=f"https://t.me/{support_user}")
+        InlineKeyboardButton(text="👨‍‍💻 Поддержка", url=f"https://t.me/{support_user}")
     ])
 
     if is_admin:
@@ -677,7 +676,6 @@ async def cb_profile(call: CallbackQuery):
     ])
     await call.message.edit_text(text, reply_markup=kb)
 
-# Редактирование баланса
 @router.callback_query(F.data == "profile_edit_balance")
 async def cb_edit_balance(call: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_for_balance)
@@ -705,7 +703,6 @@ async def process_balance_input(message: Message, state: FSMContext):
     except Exception:
         await message.answer("Введите корректную сумму числом (например: 50):")
 
-# Редактирование лимита на сделку
 @router.callback_query(F.data == "profile_edit_max_deal")
 async def cb_edit_max_deal(call: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_for_max_deal)
@@ -924,7 +921,7 @@ async def cb_toggle_ex(call: CallbackQuery):
     await cb_settings(call)
 
 
-# --- СКАНЕР СИГНАЛОВ (ФИЛЬТРАЦИЯ ПО ДЕПОЗИТУ ВАШЕГО ПРОФИЛЯ) ---
+# --- СКАНЕР СИГНАЛОВ ---
 @router.callback_query(F.data == "view_fast_signals")
 async def cb_view_fast_signals(call: CallbackQuery):
     if not await is_user_subscribed(call.from_user.id):
@@ -939,21 +936,16 @@ async def cb_view_fast_signals(call: CallbackQuery):
         await call.answer("⚠️ Ваш баланс в профиле равен $0. Задайте баланс в разделе 'Профиль'.", show_alert=True)
         return
 
-    # Расчет доступной суммы на 1 сделку
     effective_trade_amount = user_balance
     if max_deal > 0:
         effective_trade_amount = min(user_balance, max_deal)
 
     filtered = []
     for s in LATEST_SIGNALS:
-        # Фильтр 1: Спред и биржи
         if s['net_spread'] < u['min_spread']:
             continue
         if s['buy_ex'].lower() not in u['exchanges'] or s['sell_ex'].lower() not in u['exchanges']:
             continue
-            
-        # Фильтр 2: Баланс пользователя
-        # Если минимальный размер сделки превышает реальный баланс пользователя — отсекаем
         if s['min_required'] > user_balance:
             continue
             
@@ -972,7 +964,6 @@ async def cb_view_fast_signals(call: CallbackQuery):
             f"<i>Сделки фильтруются строго под ваш депозит.</i>\n\n"
         )
         for sig in filtered[:5]:
-            # Рассчитываем чистую прибыль от суммы, которую пользователь действительно выделяет на сделку
             calc_profit = round(effective_trade_amount * (sig['net_spread'] / 100.0), 2)
             
             text += (
@@ -1053,10 +1044,11 @@ async def cb_select_plan(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb)
 
 
-# --- Панель администратора ---
+# --- Панель администратора (ИСПРАВЛЕНО) ---
 @router.callback_query(F.data == "menu_admin")
 async def cb_admin_panel(call: CallbackQuery, state: FSMContext):
     if call.from_user.id not in ADMIN_IDS:
+        await call.answer("Доступ запрещен.", show_alert=True)
         return
 
     await state.clear()
@@ -1065,12 +1057,18 @@ async def cb_admin_panel(call: CallbackQuery, state: FSMContext):
     now_ts = int(time.time())
     
     db = db_mgr.conn
+    
     async with db.execute("SELECT COUNT(*) FROM users") as c1:
-        total_users = (await c1.fetchone())[0]
+        row1 = await c1.fetchone()
+        total_users = row1[0] if row1 else 0
+
     async with db.execute("SELECT COUNT(*) FROM users WHERE sub_expiry > ?", (now_ts,)) as c2:
-        active_subs = (await c2.fetchone())[0]
-    async with db.execute("SELECT SUM(amount) FROM invoices WHERE status = 'paid'") as c3:
-        total_revenue = (await c3.fetchone())[0] or 0.0
+        row2 = await c2.fetchone()
+        active_subs = row2[0] if row2 else 0
+
+    async with db.execute("SELECT COALESCE(SUM(amount), 0.0) FROM invoices WHERE status = 'paid'") as c3:
+        row3 = await c3.fetchone()
+        total_revenue = row3[0] if row3 and row3[0] is not None else 0.0
 
     text = (
         f"<b>Панель администратора</b>\n\n"
@@ -1143,7 +1141,7 @@ async def process_grant_days(message: Message, state: FSMContext):
         await state.clear()
         
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="В админку", callback_data="menu_admin")]])
-        await message.answer(f"PRO подписка для ID <code>{target_id}</code> выключена/продлена на {days} дн. До: {exp_str}", reply_markup=kb)
+        await message.answer(f"PRO подписка для ID <code>{target_id}</code> выдана на {days} дн. До: {exp_str}", reply_markup=kb)
         
         try:
             await bot.send_message(target_id, f"Вам активирована PRO-подписка на {days} дней. Активна до: <code>{exp_str}</code>")
@@ -1268,7 +1266,10 @@ async def main():
     finally:
         await crypto_pay.close()
         for ex in exchanges.values():
-            await ex.close()
+            try:
+                await ex.close()
+            except Exception:
+                pass
         await db_mgr.close()
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ PRICES = {
     "month": {"usd": 30.0, "days": 30, "name": "VIP (30 дней)"}
 }
 
+# Ключевые слова мем-коинов и низколиквидных щиткоинов
 MEME_KEYWORDS = {
     'doge', 'shib', 'pepe', 'wif', 'bonk', 'floki', 'bome', 'mew', 
     'popcat', 'turbo', 'neiro', 'brett', 'mog', 'myro', 'meme', 'lunc'
@@ -62,7 +63,7 @@ LAST_ALERT_TIMES: Dict[str, int] = {}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-# --- Менеджер Базы Данных (Singleton connection) ---
+# --- Менеджер Базы Данных ---
 class DatabaseManager:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -100,6 +101,8 @@ class Form(StatesGroup):
     waiting_for_trade_amount = State()
     waiting_for_trade_profit = State()
     waiting_for_calc_input = State()
+    waiting_for_balance = State()
+    waiting_for_max_deal = State()
 
 
 # --- Вспомогательные функции ---
@@ -152,9 +155,18 @@ async def init_db():
             sub_expiry INTEGER DEFAULT 0,
             notified_24h INTEGER DEFAULT 0,
             min_spread REAL DEFAULT 0.3,
+            balance REAL DEFAULT 50.0,
+            max_deal_amount REAL DEFAULT 0.0,
             enabled_exchanges TEXT DEFAULT '["binance","bybit","okx","gate","kucoin"]'
         )
     """)
+    # Мягкая миграция для существующих БД
+    for col, col_type in [("balance", "REAL DEFAULT 50.0"), ("max_deal_amount", "REAL DEFAULT 0.0")]:
+        try:
+            await db.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
+        except Exception:
+            pass
+
     await db.execute("""
         CREATE TABLE IF NOT EXISTS invoices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,14 +198,6 @@ async def init_db():
     await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support_username', 'support_arbitrage')")
     await db.commit()
 
-    async with db.execute("SELECT user_id, sub_expiry FROM users WHERE sub_expiry IS NOT NULL AND sub_expiry != 0") as cursor:
-        rows = await cursor.fetchall()
-        for u_id, exp_val in rows:
-            parsed = parse_expiry(exp_val)
-            if parsed != exp_val:
-                await db.execute("UPDATE users SET sub_expiry = ? WHERE user_id = ?", (parsed, u_id))
-        await db.commit()
-
 async def get_setting(key: str, default: str = "") -> str:
     async with db_mgr.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
         row = await cursor.fetchone()
@@ -209,7 +213,10 @@ async def get_sub_expiry(user_id: int) -> int:
         return parse_expiry(row[0]) if row else 0
 
 async def get_user_data(user_id: int) -> dict:
-    async with db_mgr.conn.execute("SELECT user_id, username, sub_expiry, min_spread, enabled_exchanges FROM users WHERE user_id = ?", (user_id,)) as cursor:
+    async with db_mgr.conn.execute(
+        "SELECT user_id, username, sub_expiry, min_spread, enabled_exchanges, balance, max_deal_amount FROM users WHERE user_id = ?",
+        (user_id,)
+    ) as cursor:
         row = await cursor.fetchone()
         if row:
             return {
@@ -217,15 +224,29 @@ async def get_user_data(user_id: int) -> dict:
                 "username": row[1],
                 "sub_expiry": parse_expiry(row[2]),
                 "min_spread": row[3] if row[3] is not None else 0.3,
-                "exchanges": json.loads(row[4]) if row[4] else EXCHANGE_NAMES
+                "exchanges": json.loads(row[4]) if row[4] else EXCHANGE_NAMES,
+                "balance": row[5] if row[5] is not None else 50.0,
+                "max_deal_amount": row[6] if row[6] is not None else 0.0,
             }
-        return {"user_id": user_id, "username": "User", "sub_expiry": 0, "min_spread": 0.3, "exchanges": EXCHANGE_NAMES}
+        return {
+            "user_id": user_id,
+            "username": "User",
+            "sub_expiry": 0,
+            "min_spread": 0.3,
+            "exchanges": EXCHANGE_NAMES,
+            "balance": 50.0,
+            "max_deal_amount": 0.0
+        }
 
 async def update_user(user_id: int, username: str):
     await db_mgr.conn.execute("""
         INSERT INTO users (user_id, username) VALUES (?, ?)
         ON CONFLICT(user_id) DO UPDATE SET username = excluded.username
     """, (user_id, username))
+    await db_mgr.conn.commit()
+
+async def update_user_field(user_id: int, field: str, value):
+    await db_mgr.conn.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
     await db_mgr.conn.commit()
 
 async def update_user_settings(user_id: int, min_spread: float = None, exchanges: list = None):
@@ -288,7 +309,7 @@ async def get_recent_trades(user_id: int, limit: int = 5) -> list:
         return await cursor.fetchall()
 
 
-# --- Оптимизированный класс Оплаты CryptoPay ---
+# --- Оплата CryptoPay ---
 class CryptoPayAPI:
     def __init__(self, token: str):
         self.headers = {"Crypto-Pay-API-Token": token}
@@ -332,7 +353,7 @@ class CryptoPayAPI:
 crypto_pay = CryptoPayAPI(CRYPTO_PAY_TOKEN)
 
 
-# --- Рыночный сканер ---
+# --- Рыночный сканер с глубоким фильтром ложных сигналов ---
 async def fetch_exchange_tickers(ex_name: str, ex_obj) -> Optional[Dict]:
     try:
         tickers = await asyncio.wait_for(ex_obj.fetch_tickers(), timeout=6.0)
@@ -365,10 +386,25 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
 
             bid = t.get('bid')
             ask = t.get('ask')
-            if bid and ask and bid > 0 and ask > 0:
-                if symbol not in coin_map:
-                    coin_map[symbol] = {}
-                coin_map[symbol][ex_name] = {'bid': float(bid), 'ask': float(ask)}
+            
+            # ФИЛЬТР 1: Проверка на нулевой стакан / отсутствие цен
+            if not bid or not ask or bid <= 0 or ask <= 0:
+                continue
+
+            # ФИЛЬТР 2: Проверка суточного объёма (исключаем мертвые токены без ликвидности, < $10,000)
+            quote_volume = t.get('quoteVolume') or (t.get('baseVolume', 0) * ask)
+            if quote_volume and quote_volume < 10000.0:
+                continue
+
+            # ФИЛЬТР 3: Проверка наличия объема на покупку/продажу
+            bid_vol = t.get('bidVolume', 1.0)
+            ask_vol = t.get('askVolume', 1.0)
+            if (bid_vol is not None and bid_vol <= 0) or (ask_vol is not None and ask_vol <= 0):
+                continue
+
+            if symbol not in coin_map:
+                coin_map[symbol] = {}
+            coin_map[symbol][ex_name] = {'bid': float(bid), 'ask': float(ask)}
 
     signals = []
     now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -388,10 +424,12 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
                 continue
 
             gross = ((sell_p - buy_p) / buy_p) * 100
-            net = gross - 0.20
+            net = gross - 0.20  # Комиссия бирж 0.1% + 0.1%
 
-            if 0.3 <= net <= 80.0:
-                profit_1k = round((1000 * (net / 100)), 2)
+            # ФИЛЬТР 4: Исключаем фантомный спред!
+            # Реальный межбиржевой арбитраж лежит в пределах 0.3% - 15.0%.
+            # Все что выше 15% — это закрытый ввод/вывод на бирже, разница в сетях или аномальный фантом.
+            if 0.3 <= net <= 15.0:
                 signals.append({
                     'symbol': symbol,
                     'buy_ex': best_buy_ex.upper(),
@@ -402,7 +440,7 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
                     'sell_url': get_trade_url(best_sell_ex, symbol),
                     'gross_spread': round(gross, 2),
                     'net_spread': round(net, 2),
-                    'est_profit': profit_1k,
+                    'min_required': 10.0, # Минимальный ордер на биржах ($10)
                     'time': now_utc
                 })
 
@@ -419,13 +457,14 @@ async def background_scanner_5s(bot: Bot, exchanges: Dict):
             now_ts = int(time.time())
             for sig in signals:
                 symbol = sig['symbol']
-                if sig['net_spread'] >= 0.50 and (now_ts - LAST_ALERT_TIMES.get(symbol, 0) > 120):
+                if sig['net_spread'] >= 0.50 and (now_ts - LAST_ALERT_TIMES.get(symbol, 0) > 180):
                     LAST_ALERT_TIMES[symbol] = now_ts
+                    profit_1k = round((1000 * (sig['net_spread'] / 100)), 2)
                     text = (
                         f"<b>Сигнал: {sig['symbol']}</b> (+{sig['net_spread']}%)\n\n"
                         f"• Покупка: <a href='{sig['buy_url']}'>{sig['buy_ex']}</a> — <code>{sig['buy_price']:.5f}</code>\n"
                         f"• Продажа: <a href='{sig['sell_url']}'>{sig['sell_ex']}</a> — <code>{sig['sell_price']:.5f}</code>\n"
-                        f"• Ож. профит ($1,000): <code>+${sig['est_profit']} USDT</code>\n"
+                        f"• Ож. профит ($1,000): <code>+${profit_1k} USDT</code>\n"
                         f"• Время: {sig['time']} UTC"
                     )
                     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -497,7 +536,7 @@ async def background_billing_checker(bot: Bot):
         await asyncio.sleep(10)
 
 
-# --- Aiogram Настройки ---
+# --- Aiogram Инициализация ---
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
@@ -517,23 +556,23 @@ async def get_main_menu_kb(user_id: int, is_admin: bool = False) -> InlineKeyboa
     btns = []
     if has_sub:
         btns.append([
-            InlineKeyboardButton(text="Сканер сигналов", callback_data="view_fast_signals"),
-            InlineKeyboardButton(text="Фильтры", callback_data="menu_settings")
+            InlineKeyboardButton(text="📡 Сканер сигналов", callback_data="view_fast_signals"),
+            InlineKeyboardButton(text="⚙️ Фильтры", callback_data="menu_settings")
         ])
     else:
         btns.append([InlineKeyboardButton(text="Оформить PRO", callback_data="menu_buy")])
 
     btns.append([
-        InlineKeyboardButton(text="Дневник сделок", callback_data="menu_trades"),
-        InlineKeyboardButton(text="Профиль", callback_data="menu_profile")
+        InlineKeyboardButton(text="📊 Дневник сделок", callback_data="menu_trades"),
+        InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile")
     ])
     btns.append([
-        InlineKeyboardButton(text="Инструкция", callback_data="menu_guide"),
-        InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{support_user}")
+        InlineKeyboardButton(text="📖 Инструкция", callback_data="menu_guide"),
+        InlineKeyboardButton(text="👨‍💻 Поддержка", url=f"https://t.me/{support_user}")
     ])
 
     if is_admin:
-        btns.append([InlineKeyboardButton(text="Админ-панель", callback_data="menu_admin")])
+        btns.append([InlineKeyboardButton(text="👑 Админ-панель", callback_data="menu_admin")])
 
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
@@ -589,6 +628,8 @@ async def cb_check_sub(call: CallbackQuery):
     else:
         await call.answer("Подписка на канал не обнаружена.", show_alert=True)
 
+
+# --- ПРОФИЛЬ И НАСТРОЙКА БАЛАНСА ---
 @router.callback_query(F.data == "menu_profile")
 async def cb_profile(call: CallbackQuery):
     u = await get_user_data(call.from_user.id)
@@ -608,21 +649,90 @@ async def cb_profile(call: CallbackQuery):
         exp_info = "—"
 
     uname = html.escape(call.from_user.username or 'не указан')
+    max_deal_str = f"${u['max_deal_amount']:.2f}" if u['max_deal_amount'] > 0 else "Без ограничений"
+
     text = (
         f"<b>Личный профиль</b>\n\n"
         f"• ID: <code>{call.from_user.id}</code>\n"
         f"• Юзернейм: @{uname}\n"
         f"• Подписка: <b>{sub_badge}</b>\n"
-        f"• Активна до: <code>{exp_info}</code>\n"
-        f"• Мин. спред: <code>{u['min_spread']}%</code>\n\n"
+        f"• Активна до: <code>{exp_info}</code>\n\n"
+        f"⚙️ <b>Настройки капитала для сканера:</b>\n"
+        f"💰 Ваш баланс: <b>${u['balance']:.2f} USDT</b>\n"
+        f"🎯 Макс. лимит на 1 сделку: <b>{max_deal_str}</b>\n"
+        f"📊 Мин. спред фильтра: <code>{u['min_spread']}%</code>\n\n"
         f"<b>Статистика торговли:</b>\n"
         f"• Закрыто сделок: {stats['count']}\n"
         f"• Общий оборот: ${stats['total_volume']} USDT\n"
         f"• Чистый профит: +${stats['total_profit']} USDT\n"
         f"• Средний ROI: +{stats['avg_roi']}%"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="menu_main")]])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💰 Изменить баланс", callback_data="profile_edit_balance"),
+            InlineKeyboardButton(text="⚙️ Лимит сделки", callback_data="profile_edit_max_deal")
+        ],
+        [InlineKeyboardButton(text="Назад", callback_data="menu_main")]
+    ])
     await call.message.edit_text(text, reply_markup=kb)
+
+# Редактирование баланса
+@router.callback_query(F.data == "profile_edit_balance")
+async def cb_edit_balance(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.waiting_for_balance)
+    text = (
+        "<b>Настройка баланса</b>\n\n"
+        "Введите ваш текущий баланс в $ (USDT).\n"
+        "Сканер будет подбирать смету и сделки строго под этот депозит.\n\n"
+        "<i>Пример: <code>50</code> или <code>150.5</code></i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu_profile")]])
+    await call.message.edit_text(text, reply_markup=kb)
+
+@router.message(Form.waiting_for_balance)
+async def process_balance_input(message: Message, state: FSMContext):
+    try:
+        val = float(message.text.replace(',', '.').strip())
+        if val < 0:
+            raise ValueError()
+        await update_user_field(message.from_user.id, "balance", val)
+        await state.clear()
+        
+        is_admin = message.from_user.id in ADMIN_IDS
+        kb = await get_main_menu_kb(message.from_user.id, is_admin)
+        await message.answer(f"✅ Баланс успешно обновлен: <b>${val:.2f} USDT</b>", reply_markup=kb)
+    except Exception:
+        await message.answer("Введите корректную сумму числом (например: 50):")
+
+# Редактирование лимита на сделку
+@router.callback_query(F.data == "profile_edit_max_deal")
+async def cb_edit_max_deal(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.waiting_for_max_deal)
+    text = (
+        "<b>Максимальный лимит на 1 сделку</b>\n\n"
+        "Укажите максимальную сумму в $, которую сканер может выделять на одну связку.\n"
+        "Отправьте <code>0</code>, если хотите инвестировать весь ваш баланс.\n\n"
+        "<i>Пример: <code>25</code></i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu_profile")]])
+    await call.message.edit_text(text, reply_markup=kb)
+
+@router.message(Form.waiting_for_max_deal)
+async def process_max_deal_input(message: Message, state: FSMContext):
+    try:
+        val = float(message.text.replace(',', '.').strip())
+        if val < 0:
+            raise ValueError()
+        await update_user_field(message.from_user.id, "max_deal_amount", val)
+        await state.clear()
+        
+        is_admin = message.from_user.id in ADMIN_IDS
+        kb = await get_main_menu_kb(message.from_user.id, is_admin)
+        msg_text = f"✅ Лимит на 1 сделку установлен: <b>${val:.2f} USDT</b>" if val > 0 else "✅ Лимит снят (торговля на весь баланс)."
+        await message.answer(msg_text, reply_markup=kb)
+    except Exception:
+        await message.answer("Введите корректную сумму числом (например: 25):")
 
 
 # --- Дневник и калькулятор ---
@@ -766,7 +876,7 @@ async def cb_trade_history(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb)
 
 
-# --- Настройки ---
+# --- Настройки фильтров ---
 @router.callback_query(F.data == "menu_settings")
 async def cb_settings(call: CallbackQuery):
     if not await is_user_subscribed(call.from_user.id):
@@ -814,7 +924,7 @@ async def cb_toggle_ex(call: CallbackQuery):
     await cb_settings(call)
 
 
-# --- Сигналы ---
+# --- СКАНЕР СИГНАЛОВ (ФИЛЬТРАЦИЯ ПО ДЕПОЗИТУ ВАШЕГО ПРОФИЛЯ) ---
 @router.callback_query(F.data == "view_fast_signals")
 async def cb_view_fast_signals(call: CallbackQuery):
     if not await is_user_subscribed(call.from_user.id):
@@ -822,31 +932,60 @@ async def cb_view_fast_signals(call: CallbackQuery):
         return
 
     u = await get_user_data(call.from_user.id)
-    filtered = [
-        s for s in LATEST_SIGNALS 
-        if s['net_spread'] >= u['min_spread'] 
-        and s['buy_ex'].lower() in u['exchanges'] 
-        and s['sell_ex'].lower() in u['exchanges']
-    ]
+    user_balance = u["balance"]
+    max_deal = u["max_deal_amount"]
+
+    if user_balance <= 0:
+        await call.answer("⚠️ Ваш баланс в профиле равен $0. Задайте баланс в разделе 'Профиль'.", show_alert=True)
+        return
+
+    # Расчет доступной суммы на 1 сделку
+    effective_trade_amount = user_balance
+    if max_deal > 0:
+        effective_trade_amount = min(user_balance, max_deal)
+
+    filtered = []
+    for s in LATEST_SIGNALS:
+        # Фильтр 1: Спред и биржи
+        if s['net_spread'] < u['min_spread']:
+            continue
+        if s['buy_ex'].lower() not in u['exchanges'] or s['sell_ex'].lower() not in u['exchanges']:
+            continue
+            
+        # Фильтр 2: Баланс пользователя
+        # Если минимальный размер сделки превышает реальный баланс пользователя — отсекаем
+        if s['min_required'] > user_balance:
+            continue
+            
+        filtered.append(s)
 
     if not filtered:
         text = (
-            "<b>Поиск связок...</b>\n\n"
-            "В данный момент нет актуальных связок по вашим фильтрам.\n"
-            f"Текущий минимальный спред: <code>{u['min_spread']}%</code>"
+            "<b>Поиск подходящих связок...</b>\n\n"
+            f"В данный момент нет доступных связок под ваш баланс <b>${user_balance:.2f} USDT</b>.\n"
+            f"• Мин. спред: <code>{u['min_spread']}%</code>\n"
+            "• Рынок сканируется каждые 5 секунд."
         )
     else:
-        text = f"<b>Активные связки ({len(filtered)}):</b>\n\n"
+        text = (
+            f"<b>Активные связки под ваш баланс (${user_balance:.2f} USDT):</b>\n"
+            f"<i>Сделки фильтруются строго под ваш депозит.</i>\n\n"
+        )
         for sig in filtered[:5]:
+            # Рассчитываем чистую прибыль от суммы, которую пользователь действительно выделяет на сделку
+            calc_profit = round(effective_trade_amount * (sig['net_spread'] / 100.0), 2)
+            
             text += (
                 f"• <b>{sig['symbol']}</b> ({sig['time']} UTC)\n"
                 f" Покупка: <a href='{sig['buy_url']}'>{sig['buy_ex']}</a> ➔ <code>{sig['buy_price']:.5f}</code>\n"
                 f" Продажа: <a href='{sig['sell_url']}'>{sig['sell_ex']}</a> ➔ <code>{sig['sell_price']:.5f}</code>\n"
-                f" Спред: <b>+{sig['net_spread']}%</b> | Эстимейт ($1k): <b>+${sig['est_profit']}</b>\n\n"
+                f" Спред: <b>+{sig['net_spread']}%</b>\n"
+                f" 💰 Вход в сделку: <b>${effective_trade_amount:.2f}</b> ➔ Профит: <b>+${calc_profit} USDT</b>\n\n"
             )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Обновить", callback_data="view_fast_signals")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="view_fast_signals")],
+        [InlineKeyboardButton(text="👤 Изменить баланс в профиле", callback_data="menu_profile")],
         [InlineKeyboardButton(text="Назад", callback_data="menu_main")]
     ])
     await call.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
@@ -865,7 +1004,7 @@ async def cb_guide(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb)
 
 
-# --- Покупка ---
+# --- Покупка подписки ---
 @router.callback_query(F.data == "menu_buy")
 async def cb_buy(call: CallbackQuery):
     text = (
@@ -1071,16 +1210,16 @@ async def cb_admin_export(call: CallbackQuery):
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["User ID", "Username", "Expiry Date (UTC)", "Status"])
+    writer.writerow(["User ID", "Username", "Expiry Date (UTC)", "Status", "Balance ($)"])
 
     now_ts = int(time.time())
-    async with db_mgr.conn.execute("SELECT user_id, username, sub_expiry FROM users") as cursor:
+    async with db_mgr.conn.execute("SELECT user_id, username, sub_expiry, balance FROM users") as cursor:
         rows = await cursor.fetchall()
-        for u_id, uname, exp_ts in rows:
+        for u_id, uname, exp_ts, bal in rows:
             parsed = parse_expiry(exp_ts)
             exp_str = datetime.fromtimestamp(parsed, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC') if parsed > 0 else "N/A"
             status = "Active" if parsed > now_ts else "Expired"
-            writer.writerow([u_id, uname or "N/A", exp_str, status])
+            writer.writerow([u_id, uname or "N/A", exp_str, status, bal or 0.0])
 
     file_bytes = output.getvalue().encode('utf-8')
     input_file = BufferedInputFile(file_bytes, filename="users_export.csv")
@@ -1120,7 +1259,6 @@ async def main():
     
     exchanges = {name: cls({'enableRateLimit': True}) for name, cls in EXCHANGE_CLASSES.items()}
 
-    # Исправлена передача параметров bot в сканер
     asyncio.create_task(background_scanner_5s(bot, exchanges))
     asyncio.create_task(background_billing_checker(bot))
 

@@ -5,7 +5,7 @@ import io
 import json
 import logging
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -26,19 +26,17 @@ from aiogram.types import (
     Message,
 )
 
-# =====================================================================
-# КОНФИГУРАЦИЯ СИСТЕМЫ
-# =====================================================================
+# --- Конфигурация ---
 BOT_TOKEN = "8979491056:AAEamiXQj9EZrl34ggOaPpJphHMaqMOXcYg"
 CRYPTO_PAY_TOKEN = "640413:AAozTIOPhVCXP62brvl6Bt8kL0vp9ticohx"
 
-CHANNEL_SIGNALS_ID = -1004368321305             # ID закрытого VIP-канала
-REQUIRED_CHANNEL_ID = "@arbitrnewwws"           # Публичный ТГК для обязательной подписки
-ADMIN_IDS = [8066395175]                         # Telegram ID администраторов
+CHANNEL_SIGNALS_ID = -1004368321305
+REQUIRED_CHANNEL_ID = "@arbitrnewwws"
+ADMIN_IDS = [8066395175]
 
 PRICES = {
-    "week": {"usd": 7.0, "days": 7, "name": "7 ДНЕЙ (PRO)"},
-    "month": {"usd": 30.0, "days": 30, "name": "30 ДНЕЙ (VIP)"}
+    "week": {"usd": 7.0, "days": 7, "name": "PRO (7 дней)"},
+    "month": {"usd": 30.0, "days": 30, "name": "VIP (30 дней)"}
 }
 
 MEME_KEYWORDS = {
@@ -46,7 +44,6 @@ MEME_KEYWORDS = {
     'popcat', 'turbo', 'neiro', 'brett', 'mog', 'myro', 'meme', 'lunc'
 }
 
-EXCHANGE_NAMES = ['binance', 'bybit', 'okx', 'gate', 'kucoin']
 EXCHANGE_CLASSES = {
     'binance': ccxt.binance,
     'bybit': ccxt.bybit,
@@ -54,12 +51,14 @@ EXCHANGE_CLASSES = {
     'gate': ccxt.gate,
     'kucoin': ccxt.kucoin,
 }
+EXCHANGE_NAMES = list(EXCHANGE_CLASSES.keys())
 
 DB_NAME = "bot_database.db"
 LATEST_SIGNALS: List[Dict] = []
 LAST_ALERT_TIMES: Dict[str, int] = {}
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 
 class Form(StatesGroup):
     waiting_for_support = State()
@@ -69,28 +68,42 @@ class Form(StatesGroup):
     waiting_for_trade_profit = State()
     waiting_for_calc_input = State()
 
-# =====================================================================
-# ХЕЛПЕРЫ ССЫЛОК И ТОРГОВЛИ
-# =====================================================================
+
+# --- Вспомогательные функции ---
+def parse_expiry(val) -> int:
+    """Безопасный парсинг даты окончания подписки."""
+    if not val:
+        return 0
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, str):
+        v = val.strip()
+        if not v:
+            return 0
+        try:
+            return int(float(v))
+        except ValueError:
+            pass
+        try:
+            return int(datetime.fromisoformat(v).timestamp())
+        except ValueError:
+            pass
+    return 0
+
 def get_trade_url(exchange: str, symbol: str) -> str:
     base = symbol.split('/')[0].upper()
     ex = exchange.lower()
-    
-    if ex == 'binance':
-        return f"https://www.binance.com/ru/trade/{base}_USDT?type=spot"
-    elif ex == 'bybit':
-        return f"https://www.bybit.com/trade/usdt/{base}"
-    elif ex == 'okx':
-        return f"https://www.okx.com/trade-spot/{base.lower()}-usdt"
-    elif ex == 'gate':
-        return f"https://www.gate.io/trade/{base}_USDT"
-    elif ex == 'kucoin':
-        return f"https://www.kucoin.com/trade/{base}-USDT"
-    return "https://t.me"
+    urls = {
+        'binance': f"https://www.binance.com/ru/trade/{base}_USDT?type=spot",
+        'bybit': f"https://www.bybit.com/trade/usdt/{base}",
+        'okx': f"https://www.okx.com/trade-spot/{base.lower()}-usdt",
+        'gate': f"https://www.gate.io/trade/{base}_USDT",
+        'kucoin': f"https://www.kucoin.com/trade/{base}-USDT"
+    }
+    return urls.get(ex, "https://t.me")
 
-# =====================================================================
-# БАЗА ДАННЫХ (aiosqlite)
-# =====================================================================
+
+# --- Работа с базой данных ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -134,17 +147,13 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support_username', '@support_arbitrage')")
         await db.commit()
 
-        # Автоматическая миграция подписок из ISO-строк в INTEGER (при необходимости)
-        async with db.execute("SELECT user_id, sub_expiry FROM users WHERE sub_expiry IS NOT NULL") as cursor:
+        # Валидация подписок при старте
+        async with db.execute("SELECT user_id, sub_expiry FROM users WHERE sub_expiry IS NOT NULL AND sub_expiry != 0") as cursor:
             rows = await cursor.fetchall()
             for u_id, exp_val in rows:
-                if isinstance(exp_val, str) and not exp_val.isdigit():
-                    try:
-                        dt = datetime.fromisoformat(exp_val)
-                        ts = int(dt.timestamp())
-                        await db.execute("UPDATE users SET sub_expiry = ? WHERE user_id = ?", (ts, u_id))
-                    except Exception:
-                        await db.execute("UPDATE users SET sub_expiry = 0 WHERE user_id = ?", (u_id,))
+                parsed = parse_expiry(exp_val)
+                if parsed > 0 and parsed != exp_val:
+                    await db.execute("UPDATE users SET sub_expiry = ? WHERE user_id = ?", (parsed, u_id))
             await db.commit()
 
 async def get_setting(key: str, default: str = "") -> str:
@@ -162,24 +171,18 @@ async def get_sub_expiry(user_id: int) -> int:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT sub_expiry FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
-            if row and row[0] is not None:
-                try:
-                    return int(row[0])
-                except (ValueError, TypeError):
-                    return 0
-            return 0
+            return parse_expiry(row[0]) if row else 0
 
 async def get_user_data(user_id: int) -> dict:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id, username, sub_expiry, min_spread, enabled_exchanges FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
-                sub_exp = int(row[2]) if row[2] is not None and str(row[2]).isdigit() else 0
                 return {
                     "user_id": row[0],
                     "username": row[1],
-                    "sub_expiry": sub_exp,
-                    "min_spread": row[3] or 0.3,
+                    "sub_expiry": parse_expiry(row[2]),
+                    "min_spread": row[3] if row[3] is not None else 0.3,
                     "exchanges": json.loads(row[4]) if row[4] else EXCHANGE_NAMES
                 }
             return {"user_id": user_id, "username": "User", "sub_expiry": 0, "min_spread": 0.3, "exchanges": EXCHANGE_NAMES}
@@ -202,9 +205,8 @@ async def update_user_settings(user_id: int, min_spread: float = None, exchanges
 
 async def add_subscription(user_id: int, days: int) -> int:
     now = int(time.time())
-    current_expiry = await get_sub_expiry(user_id)
-    base = max(now, current_expiry)
-    new_expiry = base + (days * 86400)
+    current = await get_sub_expiry(user_id)
+    new_expiry = max(now, current) + (days * 86400)
 
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -221,12 +223,11 @@ async def revoke_subscription(user_id: int):
         await db.commit()
 
 async def is_user_subscribed(user_id: int) -> bool:
-    expiry = await get_sub_expiry(user_id)
-    return expiry > int(time.time())
+    if user_id in ADMIN_IDS:
+        return True
+    return (await get_sub_expiry(user_id)) > int(time.time())
 
-# =====================================================================
-# ФУНКЦИИ ДНЕВНИКА СДЕЛОК
-# =====================================================================
+# --- История сделок ---
 async def save_trade(user_id: int, pair_info: str, amount_usd: float, profit_usd: float):
     roi = (profit_usd / amount_usd * 100) if amount_usd > 0 else 0.0
     async with aiosqlite.connect(DB_NAME) as db:
@@ -258,13 +259,11 @@ async def get_recent_trades(user_id: int, limit: int = 5) -> list:
         """, (user_id, limit)) as cursor:
             return await cursor.fetchall()
 
-# =====================================================================
-# ПЛАТЕЖНЫЙ ШЛЮЗ: CRYPTOBOT
-# =====================================================================
+
+# --- Оплата CryptoPay ---
 class CryptoPayAPI:
     def __init__(self, token: str):
-        self.token = token
-        self.headers = {"Crypto-Pay-API-Token": self.token}
+        self.headers = {"Crypto-Pay-API-Token": token}
         self.base_url = "https://pay.crypt.bot/api/"
 
     async def create_invoice(self, amount: float, payload: str) -> Optional[Dict]:
@@ -289,14 +288,13 @@ class CryptoPayAPI:
                     if res.get("ok") and res["result"]["items"]:
                         return res["result"]["items"][0]
         except Exception as e:
-            logging.error(f"CryptoPay getInvoice error: {e}")
+            logging.error(f"CryptoPay get error: {e}")
         return None
 
 crypto_pay = CryptoPayAPI(CRYPTO_PAY_TOKEN)
 
-# =====================================================================
-# СКАНИРОВАНИЕ БИРЖ
-# =====================================================================
+
+# --- Мониторинг рынка ---
 async def fetch_top_clean_coins(session: aiohttp.ClientSession) -> List[str]:
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 80, "page": 1}
@@ -306,14 +304,14 @@ async def fetch_top_clean_coins(session: aiohttp.ClientSession) -> List[str]:
             if resp.status == 200:
                 data = await resp.json()
                 for item in data:
-                    symbol = item.get('symbol', '').upper()
-                    coin_id = item.get('id', '').lower()
+                    sym = item.get('symbol', '').upper()
+                    cid = item.get('id', '').lower()
                     name = item.get('name', '').lower()
-                    if not any(kw in coin_id or kw in name or kw == symbol.lower() for kw in MEME_KEYWORDS):
-                        clean_symbols.append(f"{symbol}/USDT")
+                    if not any(kw in cid or kw in name or kw == sym.lower() for kw in MEME_KEYWORDS):
+                        clean_symbols.append(f"{sym}/USDT")
     except Exception as e:
         logging.error(f"CoinGecko error: {e}")
-    return clean_symbols or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "ADA/USDT", "AVAX/USDT", "NEAR/USDT", "SUI/USDT", "APT/USDT"]
+    return clean_symbols or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "ADA/USDT", "AVAX/USDT", "NEAR/USDT", "SUI/USDT"]
 
 async def fetch_exchange_tickers(ex_name: str, ex_obj) -> Optional[Dict]:
     try:
@@ -355,11 +353,11 @@ async def scan_market_5s(exchanges: Dict, session: aiohttp.ClientSession) -> Lis
         best_sell, max_bid = max(coin_prices.items(), key=lambda x: x[1]['bid'])
 
         if best_buy != best_sell:
-            gross_spread = ((max_bid['bid'] - min_ask['ask']) / min_ask['ask']) * 100
-            net_spread = gross_spread - 0.20
+            gross = ((max_bid['bid'] - min_ask['ask']) / min_ask['ask']) * 100
+            net = gross - 0.20
 
-            if net_spread >= 0.25:
-                est_profit_1k = round((1000 * (net_spread / 100)), 2)
+            if net >= 0.25:
+                profit_1k = round((1000 * (net / 100)), 2)
                 signals.append({
                     'symbol': symbol,
                     'buy_ex': best_buy.upper(),
@@ -368,18 +366,17 @@ async def scan_market_5s(exchanges: Dict, session: aiohttp.ClientSession) -> Lis
                     'sell_ex': best_sell.upper(),
                     'sell_price': max_bid['bid'],
                     'sell_url': get_trade_url(best_sell, symbol),
-                    'gross_spread': round(gross_spread, 2),
-                    'net_spread': round(net_spread, 2),
-                    'est_profit': est_profit_1k,
+                    'gross_spread': round(gross, 2),
+                    'net_spread': round(net, 2),
+                    'est_profit': profit_1k,
                     'time': now_utc
                 })
 
     LATEST_SIGNALS = signals
     return signals
 
-# =====================================================================
-# ФОНОВЫЕ ЗАДАЧИ
-# =====================================================================
+
+# --- Фоновые процессы ---
 async def background_scanner_5s(bot: Bot, exchanges: Dict):
     async with aiohttp.ClientSession() as session:
         while True:
@@ -388,29 +385,26 @@ async def background_scanner_5s(bot: Bot, exchanges: Dict):
                 now_ts = int(time.time())
                 for sig in signals:
                     symbol = sig['symbol']
-                    # Кулдаун 120 сек на повторные алерты по одной паре
                     if sig['net_spread'] >= 0.40 and (now_ts - LAST_ALERT_TIMES.get(symbol, 0) > 120):
                         LAST_ALERT_TIMES[symbol] = now_ts
                         text = (
-                            f"🚨 <b>ARBITRAGE ALERT | {sig['symbol']}</b>\n"
-                            f"────────────────────────\n"
-                            f"🟢 <b>BUY:</b> <a href='{sig['buy_url']}'>{sig['buy_ex']}</a> ➔ <code>{sig['buy_price']:.5f} USDT</code>\n"
-                            f"🔴 <b>SELL:</b> <a href='{sig['sell_url']}'>{sig['sell_ex']}</a> ➔ <code>{sig['sell_price']:.5f} USDT</code>\n"
-                            f"────────────────────────\n"
-                            f"📈 <b>Чистый спред:</b> <code>+{sig['net_spread']}%</code>\n"
-                            f"💵 <b>Профит с $1,000:</b> <code>~${sig['est_profit']} USDT</code>\n"
-                            f"⏱ <b>Время:</b> <code>{sig['time']} UTC</code>\n"
-                            f"🌐 <b>Сеть вывода:</b> <code>AVAILABLE [TRC20/ERC20]</code>"
+                            f"🚨 <b>#{sig['symbol'].replace('/USDT', '')}</b> | <code>+{sig['net_spread']}%</code>\n"
+                            f"──────────────\n"
+                            f"🟢 <b>Покупка:</b> <a href='{sig['buy_url']}'>{sig['buy_ex']}</a> ➔ <code>{sig['buy_price']:.5f}</code>\n"
+                            f"🔴 <b>Продажа:</b> <a href='{sig['sell_url']}'>{sig['sell_ex']}</a> ➔ <code>{sig['sell_price']:.5f}</code>\n"
+                            f"──────────────\n"
+                            f"💵 <b>Профит с $1,000:</b> <code>+${sig['est_profit']} USDT</code>\n"
+                            f"⏱ <b>Обновлено:</b> <code>{sig['time']} UTC</code>"
                         )
                         kb = InlineKeyboardMarkup(inline_keyboard=[
                             [
-                                InlineKeyboardButton(text=f"🟢 Купить на {sig['buy_ex']}", url=sig['buy_url']),
-                                InlineKeyboardButton(text=f"🔴 Продать на {sig['sell_ex']}", url=sig['sell_url'])
+                                InlineKeyboardButton(text=f"Купить ({sig['buy_ex']})", url=sig['buy_url']),
+                                InlineKeyboardButton(text=f"Продать ({sig['sell_ex']})", url=sig['sell_url'])
                             ]
                         ])
                         await bot.send_message(CHANNEL_SIGNALS_ID, text, reply_markup=kb, disable_web_page_preview=True)
             except Exception as e:
-                logging.error(f"Scanner background error: {e}")
+                logging.error(f"Scanner bg error: {e}")
             await asyncio.sleep(5)
 
 async def background_billing_checker(bot: Bot):
@@ -422,58 +416,58 @@ async def background_billing_checker(bot: Bot):
                     invoices = await cursor.fetchall()
 
                 for row_id, inv_id, provider, u_id, plan in invoices:
-                    is_paid = False
-                    if provider == "cryptobot":
-                        inv = await crypto_pay.get_invoice(inv_id)
-                        if inv and inv.get("status") == "paid":
-                            is_paid = True
+                    try:
+                        if provider == "cryptobot":
+                            inv = await crypto_pay.get_invoice(inv_id)
+                            if inv:
+                                st = inv.get("status")
+                                if st == "paid":
+                                    upd = await db.execute("UPDATE invoices SET status = 'paid' WHERE id = ? AND status = 'active'", (row_id,))
+                                    await db.commit()
+                                    if upd.rowcount > 0:
+                                        new_exp = await add_subscription(u_id, PRICES[plan]["days"])
+                                        exp_str = datetime.fromtimestamp(new_exp, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
+                                        kb = await get_main_menu_kb(u_id, u_id in ADMIN_IDS)
+                                        try:
+                                            await bot.send_message(
+                                                u_id,
+                                                f"🎉 <b>Оплата успешно получена!</b>\n\n"
+                                                f"Тариф: <b>{PRICES[plan]['name']}</b>\n"
+                                                f"Активен до: <code>{exp_str}</code>\n\n"
+                                                f"Все функции сканера и VIP-канал доступны.",
+                                                reply_markup=kb
+                                            )
+                                        except Exception:
+                                            pass
+                                elif st == "expired":
+                                    await db.execute("UPDATE invoices SET status = 'expired' WHERE id = ?", (row_id,))
+                                    await db.commit()
+                    except Exception as inv_err:
+                        logging.error(f"Invoice check error {inv_id}: {inv_err}")
 
-                    if is_paid:
-                        # Атомарно меняем статус, чтобы исключить начисление дважды
-                        cursor_upd = await db.execute("UPDATE invoices SET status = 'paid' WHERE id = ? AND status = 'active'", (row_id,))
-                        await db.commit()
-                        
-                        if cursor_upd.rowcount > 0:
-                            new_exp_ts = await add_subscription(u_id, PRICES[plan]["days"])
-                            exp_dt_str = datetime.fromtimestamp(new_exp_ts, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
-                            
-                            is_admin = u_id in ADMIN_IDS
-                            kb = await get_main_menu_kb(u_id, is_admin)
-                            try:
-                                await bot.send_message(
-                                    u_id,
-                                    f"✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА!</b>\n\n"
-                                    f"Активирован тариф: <b>{PRICES[plan]['name']}</b>\n"
-                                    f"Срок действия до: <code>{exp_dt_str}</code>\n\n"
-                                    f"🔓 Все фильтры, быстрые сигналы и VIP-канал открыты.",
-                                    reply_markup=kb
-                                )
-                            except Exception:
-                                pass
-
-                # Уведомления за 24 часа
-                target_time = now_ts + 86400
+                # Уведомление за 24 часа
                 async with db.execute("SELECT user_id, sub_expiry FROM users WHERE notified_24h = 0 AND sub_expiry > ?", (now_ts,)) as cursor:
                     users = await cursor.fetchall()
 
                 for u_id, exp_ts in users:
-                    if exp_ts and now_ts < exp_ts <= target_time:
+                    parsed_exp = parse_expiry(exp_ts)
+                    if parsed_exp and now_ts < parsed_exp <= (now_ts + 86400):
                         try:
-                            await bot.send_message(u_id, "⚠️ <b>ВНИМАНИЕ!</b> До окончания вашей PRO-подписки осталось менее 24 часов. Продлите доступ, чтобы не потерять сигналы.")
+                            await bot.send_message(u_id, "⏳ <b>Напоминание:</b> До окончания подписки осталось меньше 24 часов.")
                             await db.execute("UPDATE users SET notified_24h = 1 WHERE user_id = ?", (u_id,))
                             await db.commit()
                         except Exception:
                             pass
         except Exception as e:
-            logging.error(f"Billing Error: {e}")
+            logging.error(f"Billing bg error: {e}")
         await asyncio.sleep(10)
 
-# =====================================================================
-# UI / ИНТЕРФЕЙС И КНОПКИ
-# =====================================================================
+
+# --- Инициализация Aiogram ---
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
+
 
 async def check_channel_sub(user_id: int) -> bool:
     try:
@@ -484,64 +478,58 @@ async def check_channel_sub(user_id: int) -> bool:
 
 async def get_main_menu_kb(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
     has_sub = await is_user_subscribed(user_id)
-    support_user = await get_setting("support_username", "@support_arbitrage")
-    clean_support = support_user.replace("@", "")
+    support_user = (await get_setting("support_username", "@support_arbitrage")).replace("@", "")
 
-    buttons = []
+    btns = []
     if has_sub:
-        buttons.append([
-            InlineKeyboardButton(text="⚡ LIVE СКАНЕР", callback_data="view_fast_signals"),
-            InlineKeyboardButton(text="⚙️ ФИЛЬТРЫ", callback_data="menu_settings")
+        btns.append([
+            InlineKeyboardButton(text="⚡ Сканер сигналов", callback_data="view_fast_signals"),
+            InlineKeyboardButton(text="⚙️ Фильтры", callback_data="menu_settings")
         ])
-        buttons.append([InlineKeyboardButton(text="📊 ДНЕВНИК & КАЛЬКУЛЯТОР", callback_data="menu_trades")])
-        buttons.append([InlineKeyboardButton(text="💳 ПРОДЛИТЬ ПОДПИСКУ", callback_data="menu_buy")])
     else:
-        buttons.append([InlineKeyboardButton(text="🔥 АКТИВИРОВАТЬ PRO ДОСТУП", callback_data="menu_buy")])
-        buttons.append([InlineKeyboardButton(text="📊 ДНЕВНИК & КАЛЬКУЛЯТОР", callback_data="menu_trades")])
+        btns.append([InlineKeyboardButton(text="💎 Оформить подписку", callback_data="menu_buy")])
 
-    buttons.append([
-        InlineKeyboardButton(text="👤 ЛИЧНЫЙ КАБИНЕТ", callback_data="menu_profile"),
-        InlineKeyboardButton(text="📖 ИНСТРУКЦИЯ", callback_data="menu_guide")
+    btns.append([
+        InlineKeyboardButton(text="📊 Дневник сделок", callback_data="menu_trades"),
+        InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile")
     ])
-    buttons.append([
-        InlineKeyboardButton(text="💬 ПОДДЕРЖКА", url=f"https://t.me/{clean_support}"),
-        InlineKeyboardButton(text="📢 НАШ КАНАЛ", url=f"https://t.me/{REQUIRED_CHANNEL_ID.replace('@', '')}")
+    btns.append([
+        InlineKeyboardButton(text="📖 Инструкция", callback_data="menu_guide"),
+        InlineKeyboardButton(text="💬 Поддержка", url=f"https://t.me/{support_user}")
     ])
 
     if is_admin:
-        buttons.append([InlineKeyboardButton(text="🛠 АДМИН ПАНЕЛЬ", callback_data="menu_admin")])
+        btns.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="menu_admin")])
 
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=btns)
 
-# =====================================================================
-# ОБРАБОТКА КОМАНД И МЕНЮ
-# =====================================================================
+
+# --- Обработчики команд и меню ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await update_user(message.from_user.id, message.from_user.username or "User")
     
     if not await check_channel_sub(message.from_user.id):
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 ПОДПИСАТЬСЯ НА КАНАЛ", url=f"https://t.me/{REQUIRED_CHANNEL_ID.replace('@', '')}")],
-            [InlineKeyboardButton(text="🔄 ПРОВЕРИТЬ ПОДПИСКУ", callback_data="check_sub")]
+            [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{REQUIRED_CHANNEL_ID.replace('@', '')}")],
+            [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]
         ])
         await message.answer(
-            "🔒 <b>ДОСТУП ОГРАНИЧЕН</b>\n\n"
-            "Для использования сканера подпишитесь на официальный канал сообщества.",
+            "👋 <b>Добро пожаловать!</b>\n\n"
+            "Для доступа к боту необходимо подписаться на наш основной канал.",
             reply_markup=kb
         )
         return
 
     is_admin = message.from_user.id in ADMIN_IDS
     kb = await get_main_menu_kb(message.from_user.id, is_admin)
-    
     text = (
-        "⚡️ <b>CRYPTO ARBITRAGE SCANNER PRO v3.4</b>\n"
-        "────────────────────────\n"
-        "🟢 <b>Статус системы:</b> <code>ONLINE [5 EXCHANGES]</code>\n"
-        "⏱ <b>Интервал обновления:</b> <code>5 сек</code>\n"
-        "🛡 <b>Фильтр мемкоинов:</b> <code>АКТИВЕН</code>\n\n"
-        "Сканер отслеживает межбиржевой спред в реальном времени. Выберите действие в меню ниже."
+        "💎 <b>Arbitrage Hub</b>\n"
+        "──────────────\n"
+        "🟢 <b>Статус:</b> <code>ONLINE</code>\n"
+        "🔄 <b>Биржи:</b> Binance, Bybit, OKX, Gate, KuCoin\n"
+        "⏱ <b>Обновление:</b> 5 секунд\n\n"
+        "Выберите нужный раздел в меню ниже:"
     )
     await message.answer(text, reply_markup=kb)
 
@@ -551,12 +539,12 @@ async def cb_menu_main(call: CallbackQuery, state: FSMContext):
     is_admin = call.from_user.id in ADMIN_IDS
     kb = await get_main_menu_kb(call.from_user.id, is_admin)
     text = (
-        "⚡️ <b>CRYPTO ARBITRAGE SCANNER PRO v3.4</b>\n"
-        "────────────────────────\n"
-        "🟢 <b>Статус системы:</b> <code>ONLINE [5 EXCHANGES]</code>\n"
-        "⏱ <b>Интервал обновления:</b> <code>5 сек</code>\n"
-        "🛡 <b>Фильтр мемкоинов:</b> <code>АКТИВЕН</code>\n\n"
-        "Сканер отслеживает межбиржевой спред в реальном времени. Выберите действие в меню ниже."
+        "💎 <b>Arbitrage Hub</b>\n"
+        "──────────────\n"
+        "🟢 <b>Статус:</b> <code>ONLINE</code>\n"
+        "🔄 <b>Биржи:</b> Binance, Bybit, OKX, Gate, KuCoin\n"
+        "⏱ <b>Обновление:</b> 5 секунд\n\n"
+        "Выберите нужный раздел в меню ниже:"
     )
     await call.message.edit_text(text, reply_markup=kb)
 
@@ -565,36 +553,35 @@ async def cb_check_sub(call: CallbackQuery):
     if await check_channel_sub(call.from_user.id):
         is_admin = call.from_user.id in ADMIN_IDS
         kb = await get_main_menu_kb(call.from_user.id, is_admin)
-        await call.message.edit_text("✅ <b>Подписка подтверждена! Добро пожаловать.</b>", reply_markup=kb)
+        await call.message.edit_text("✅ Подписка подтверждена!", reply_markup=kb)
     else:
-        await call.answer("❌ Вы не подписались на канал!", show_alert=True)
+        await call.answer("❌ Подписка не найдена. Проверьте еще раз!", show_alert=True)
 
 @router.callback_query(F.data == "menu_profile")
 async def cb_profile(call: CallbackQuery):
     u = await get_user_data(call.from_user.id)
     stats = await get_user_trade_stats(call.from_user.id)
-    
     now_ts = int(time.time())
     exp_ts = u.get("sub_expiry", 0)
-    
-    if exp_ts > now_ts:
-        sub_badge = "🟢 PRO VIP"
-        exp_info = datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
-    else:
-        sub_badge = "🔴 НЕ АКТИВНА"
-        exp_info = "Отсутствует"
 
-    username_safe = html.escape(call.from_user.username or 'не задан')
+    if call.from_user.id in ADMIN_IDS or exp_ts > now_ts:
+        sub_badge = "PRO"
+        exp_info = datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC') if exp_ts > now_ts else "Бессрочно (Admin)"
+    else:
+        sub_badge = "Не активна"
+        exp_info = "—"
+
+    uname = html.escape(call.from_user.username or 'не указан')
     text = (
-        f"👤 <b>ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ</b>\n"
-        f"────────────────────────\n"
-        f"🆔 <b>ID:</b> <code>{call.from_user.id}</code>\n"
-        f"👤 <b>Юзернейм:</b> @{username_safe}\n"
-        f"💎 <b>Статус подписки:</b> {sub_badge}\n"
-        f"⏳ <b>Действительна до:</b> <code>{exp_info}</code>\n"
-        f"⚙️ <b>Мин. спред:</b> <code>{u['min_spread']}%</code>\n\n"
-        f"📊 <b>СТАТИСТИКА ТОРГОВЛИ:</b>\n"
-        f"• Выполнено сделок: <b>{stats['count']}</b>\n"
+        f"👤 <b>Личный кабинет</b>\n"
+        f"──────────────\n"
+        f"🆔 ID: <code>{call.from_user.id}</code>\n"
+        f"Юзернейм: @{uname}\n"
+        f"Подписка: <b>{sub_badge}</b>\n"
+        f"Действует до: <code>{exp_info}</code>\n"
+        f"Мин. спред: <code>{u['min_spread']}%</code>\n\n"
+        f"📊 <b>Ваша статистика:</b>\n"
+        f"• Сделок закрыто: <b>{stats['count']}</b>\n"
         f"• Общий оборот: <b>${stats['total_volume']} USDT</b>\n"
         f"• Чистый профит: <b>+${stats['total_profit']} USDT</b>\n"
         f"• Средний ROI: <b>+{stats['avg_roi']}%</b>"
@@ -602,65 +589,55 @@ async def cb_profile(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")]])
     await call.message.edit_text(text, reply_markup=kb)
 
-# =====================================================================
-# ДНЕВНИК СДЕЛОК И КАЛЬКУЛЯТОР
-# =====================================================================
+
+# --- Дневник и Калькулятор ---
 @router.callback_query(F.data == "menu_trades")
 async def cb_trades_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
     stats = await get_user_trade_stats(call.from_user.id)
     recent = await get_recent_trades(call.from_user.id, limit=3)
 
-    history_text = ""
+    history = ""
     if recent:
-        history_text = "\n<b>📜 ПОСЛЕДНИЕ СДЕЛКИ:</b>\n"
-        for p_info, amt, prof, roi, dt in recent:
-            history_text += f"• <code>{html.escape(str(p_info))}</code> | Вход: <b>${amt}</b> | Профит: <b>+${prof} (+{roi}%)</b>\n"
+        history = "\n<b>Последние записи:</b>\n"
+        for p_info, amt, prof, roi, _ in recent:
+            history += f"• <code>{html.escape(str(p_info))}</code> | Вход: ${amt} | Профит: <b>+${prof} (+{roi}%)</b>\n"
 
     text = (
-        f"📊 <b>ДНЕВНИК СДЕЛОК И КАЛЬКУЛЯТОР</b>\n"
-        f"────────────────────────\n"
-        f"💼 <b>Общий оборот:</b> <code>${stats['total_volume']} USDT</code>\n"
-        f"💰 <b>Чистый заработок:</b> <code>+${stats['total_profit']} USDT</code>\n"
-        f"📈 <b>Всего сделок:</b> <code>{stats['count']}</code>\n"
-        f"{history_text}\n"
-        f"Выберите нужное действие ниже:"
+        f"📊 <b>Дневник сделок & Калькулятор</b>\n"
+        f"──────────────\n"
+        f"💼 Оборот: <code>${stats['total_volume']} USDT</code>\n"
+        f"💰 Профит: <code>+${stats['total_profit']} USDT</code>\n"
+        f"📈 Сделок: <code>{stats['count']}</code>\n"
+        f"{history}\n"
+        f"Выберите действие:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="➕ ЗАПИСАТЬ СДЕЛКУ", callback_data="trade_add"),
-            InlineKeyboardButton(text="🧮 КАЛЬКУЛЯТОР", callback_data="trade_calc")
+            InlineKeyboardButton(text="➕ Новая запись", callback_data="trade_add"),
+            InlineKeyboardButton(text="🧮 Калькулятор", callback_data="trade_calc")
         ],
-        [InlineKeyboardButton(text="📜 ПОЛНАЯ ИСТОРИЯ", callback_data="trade_history")],
-        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu_main")]
+        [InlineKeyboardButton(text="📜 Вся история", callback_data="trade_history")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
     ])
     await call.message.edit_text(text, reply_markup=kb)
 
 @router.callback_query(F.data == "trade_add")
-async def cb_trade_add_start(call: CallbackQuery, state: FSMContext):
+async def cb_trade_add(call: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_for_trade_pair)
     text = (
-        "➕ <b>ДОБАВЛЕНИЕ СДЕЛКИ (Шаг 1/3)</b>\n"
-        "────────────────────────\n"
-        "Введите парную информацию или название монеты и бирж.\n\n"
-        "<i>Пример: <code>SOL Binance -> Bybit</code> или <code>BTC/USDT</code></i>"
+        "📝 <b>Запись сделки (1/3)</b>\n\n"
+        "Введите связку или монету:\n"
+        "<i>Например: <code>SOL Binance -> Bybit</code></i>"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu_trades")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu_trades")]])
     await call.message.edit_text(text, reply_markup=kb)
 
 @router.message(Form.waiting_for_trade_pair)
 async def process_trade_pair(message: Message, state: FSMContext):
     await state.update_data(pair_info=message.text.strip())
     await state.set_state(Form.waiting_for_trade_amount)
-    
-    text = (
-        "➕ <b>ДОБАВЛЕНИЕ СДЕЛКИ (Шаг 2/3)</b>\n"
-        "────────────────────────\n"
-        "Введите **сумму покупки / депозит** в USDT ($):\n\n"
-        "<i>Пример: <code>1000</code></i>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu_trades")]])
-    await message.answer(text, reply_markup=kb)
+    await message.answer("📝 <b>Запись сделки (2/3)</b>\n\nВведите сумму входа ($):\n<i>Например: <code>1000</code></i>")
 
 @router.message(Form.waiting_for_trade_amount)
 async def process_trade_amount(message: Message, state: FSMContext):
@@ -670,17 +647,9 @@ async def process_trade_amount(message: Message, state: FSMContext):
             raise ValueError()
         await state.update_data(amount_usd=amt)
         await state.set_state(Form.waiting_for_trade_profit)
-        
-        text = (
-            "➕ <b>ДОБАВЛЕНИЕ СДЕЛКИ (Шаг 3/3)</b>\n"
-            "────────────────────────\n"
-            "Введите **полученный чистый профит** в USDT ($):\n\n"
-            "<i>Пример: <code>18.5</code></i>"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu_trades")]])
-        await message.answer(text, reply_markup=kb)
+        await message.answer("📝 <b>Запись сделки (3/3)</b>\n\nВведите чистый профит ($):\n<i>Например: <code>12.5</code></i>")
     except Exception:
-        await message.answer("❌ Введите корректное число (например: 1000)!")
+        await message.answer("❌ Введите корректную сумму числом (например: 1000)")
 
 @router.message(Form.waiting_for_trade_profit)
 async def process_trade_profit(message: Message, state: FSMContext):
@@ -692,35 +661,28 @@ async def process_trade_profit(message: Message, state: FSMContext):
         roi = round((prof / data['amount_usd'] * 100), 2)
         await state.clear()
         
-        text = (
-            "✅ <b>СДЕЛКА УСПЕШНО СОХРАНЕНА!</b>\n"
-            "────────────────────────\n"
-            f"📌 Пара/Биржи: <b>{html.escape(data['pair_info'])}</b>\n"
-            f"💵 Депозит: <b>${data['amount_usd']} USDT</b>\n"
-            f"📈 Чистый профит: <b>+${prof} USDT (+{roi}%)</b>\n\n"
-            "Данные внесены в ваш личный профиль и дневник!"
+        kb = await get_main_menu_kb(message.from_user.id, message.from_user.id in ADMIN_IDS)
+        await message.answer(
+            f"✅ <b>Сделка зафиксирована!</b>\n\n"
+            f"Пара: <b>{html.escape(data['pair_info'])}</b>\n"
+            f"Сумма: <b>${data['amount_usd']}</b>\n"
+            f"Профит: <b>+${prof} USDT (+{roi}%)</b>",
+            reply_markup=kb
         )
-        is_admin = message.from_user.id in ADMIN_IDS
-        kb = await get_main_menu_kb(message.from_user.id, is_admin)
-        await message.answer(text, reply_markup=kb)
     except Exception:
-        await message.answer("❌ Введите корректное число профита (например: 15.5)!")
+        await message.answer("❌ Введите числом профит (например: 12.5)")
 
-# =====================================================================
-# БЫСТРЫЙ КАЛЬКУЛЯТОР
-# =====================================================================
 @router.callback_query(F.data == "trade_calc")
 async def cb_calc_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_for_calc_input)
     text = (
-        "🧮 <b>АРБИТРАЖНЫЙ КАЛЬКУЛЯТОР</b>\n"
-        "────────────────────────\n"
-        "Рассчитайте чистую прибыль с учетом стандартных комиссий бирж (0.1% Buy + 0.1% Sell).\n\n"
-        "Отправьте 3 числа через пробел:\n"
-        "<code>[Депозит $] [Цена покупки] [Цена продажи]</code>\n\n"
-        "<i>Пример: <code>1000 65000 65800</code></i>"
+        "🧮 <b>Быстрый калькулятор</b>\n\n"
+        "Автоматически учитывает комиссию бирж (0.1% + 0.1%).\n"
+        "Отправьте 3 значения через пробел:\n"
+        "<code>[Депозит] [Цена покупки] [Цена продажи]</code>\n\n"
+        "<i>Пример: <code>1000 142.5 144.1</code></i>"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Назад", callback_data="menu_trades")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="menu_trades")]])
     await call.message.edit_text(text, reply_markup=kb)
 
 @router.message(Form.waiting_for_calc_input)
@@ -730,69 +692,62 @@ async def process_calc_input(message: Message, state: FSMContext):
         if len(parts) != 3:
             raise ValueError()
         
-        capital = float(parts[0])
-        buy_p = float(parts[1])
-        sell_p = float(parts[2])
-        
+        capital, buy_p, sell_p = map(float, parts)
         if capital <= 0 or buy_p <= 0 or sell_p <= 0:
             raise ValueError()
 
-        # Расчет
-        coins_bought = (capital * 0.999) / buy_p  
-        usd_received = (coins_bought * sell_p) * 0.999 
-        
-        net_profit = round(usd_received - capital, 2)
+        bought = (capital * 0.999) / buy_p
+        received = (bought * sell_p) * 0.999
+        net_profit = round(received - capital, 2)
         roi = round((net_profit / capital * 100), 2)
-        gross_spread = round(((sell_p - buy_p) / buy_p * 100), 2)
+        gross = round(((sell_p - buy_p) / buy_p * 100), 2)
         
         await state.clear()
-        
-        status_emoji = "🟢" if net_profit > 0 else "🔴"
+        status = "🟢" if net_profit > 0 else "🔴"
         text = (
-            f"🧮 <b>РЕЗУЛЬТАТ РАСЧЕТА</b>\n"
-            f"────────────────────────\n"
-            f"💵 Депозит: <b>${capital:.2f} USDT</b>\n"
-            f"📈 Грязный спред: <b>+{gross_spread}%</b>\n"
-            f"⚙️ Учтенная комиссия бирж: <b>-0.2%</b>\n"
-            f"────────────────────────\n"
-            f"{status_emoji} Чистый профит: <b>+${net_profit} USDT</b>\n"
+            f"🧮 <b>Расчет связки</b>\n"
+            f"──────────────\n"
+            f"Депозит: <b>${capital:.2f} USDT</b>\n"
+            f"Грязный спред: <b>+{gross}%</b>\n"
+            f"Комиссия бирж: <b>-0.2%</b>\n"
+            f"──────────────\n"
+            f"{status} Чистый профит: <b>+${net_profit} USDT</b>\n"
             f"📊 Чистый ROI: <b>+{roi}%</b>"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Рассчитать еще", callback_data="trade_calc")],
-            [InlineKeyboardButton(text="◀️ В меню дневника", callback_data="menu_trades")]
+            [InlineKeyboardButton(text="◀️ В дневник", callback_data="menu_trades")]
         ])
         await message.answer(text, reply_markup=kb)
     except Exception:
-        await message.answer("❌ Неверный формат! Введите 3 положительных числа через пробел.\n<i>Пример: 1000 65000 65800</i>")
+        await message.answer("❌ Формат: 3 положительных числа через пробел.\n<i>Пример: 1000 142.5 144.1</i>")
 
 @router.callback_query(F.data == "trade_history")
 async def cb_trade_history(call: CallbackQuery):
     trades = await get_recent_trades(call.from_user.id, limit=15)
     if not trades:
-        text = "📜 <b>ИСТОРИЯ СДЕЛОК ПУСТА</b>\n\nВы еще не зафиксировали ни одной сделки."
+        text = "📜 <b>История сделок пуста.</b>"
     else:
-        text = "📜 <b>ПОЛНАЯ ИСТОРИЯ СДЕЛОК (Последние 15)</b>\n────────────────────────\n\n"
-        for p_info, amt, prof, roi, dt in trades:
-            text += f"🔹 <b>{html.escape(str(p_info))}</b>\n   Депозит: ${amt} | Профит: <b>+${prof} USDT (+{roi}%)</b>\n\n"
+        text = "📜 <b>История последних 15 сделок:</b>\n──────────────\n\n"
+        for p_info, amt, prof, roi, _ in trades:
+            text += f"• <b>{html.escape(str(p_info))}</b>\n  Депозит: ${amt} | Профит: <b>+${prof} USDT (+{roi}%)</b>\n\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="menu_trades")]])
     await call.message.edit_text(text, reply_markup=kb)
 
-# =====================================================================
-# НАСТРОЙКИ И ФИЛЬТРЫ
-# =====================================================================
+
+# --- Настройки ---
 @router.callback_query(F.data == "menu_settings")
 async def cb_settings(call: CallbackQuery):
     if not await is_user_subscribed(call.from_user.id):
-        await call.answer("❌ Настройки доступны только для пользователей с PRO подпиской!", show_alert=True)
+        await call.answer("❌ Настройки доступны только с PRO подпиской!", show_alert=True)
         return
 
     u = await get_user_data(call.from_user.id)
     text = (
-        "⚙️ <b>НАСТРОЙКИ СКАНЕРА</b>\n"
-        "────────────────────────\n"
-        "Укажите минимальный процент чистейшего спреда и список используемых бирж для фильтрации связок."
+        "⚙️ <b>Настройки фильтрации</b>\n"
+        "──────────────\n"
+        "Настройте минимальный спред и отключите ненужные биржи:"
     )
     
     spread_btns = []
@@ -810,7 +765,7 @@ async def cb_settings(call: CallbackQuery):
         spread_btns,
         [ex_btns[0], ex_btns[1], ex_btns[2]],
         [ex_btns[3], ex_btns[4]],
-        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu_main")]
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")]
     ])
     await call.message.edit_text(text, reply_markup=kb)
 
@@ -825,21 +780,19 @@ async def cb_toggle_ex(call: CallbackQuery):
     ex = call.data.replace("toggle_ex_", "")
     u = await get_user_data(call.from_user.id)
     exs = u["exchanges"]
-    if ex in exs:
-        if len(exs) > 2:
-            exs.remove(ex)
-    else:
+    if ex in exs and len(exs) > 2:
+        exs.remove(ex)
+    elif ex not in exs:
         exs.append(ex)
     await update_user_settings(call.from_user.id, exchanges=exs)
     await cb_settings(call)
 
-# =====================================================================
-# ПРОСМОТР СИГНАЛОВ И ИНСТРУКЦИЙ
-# =====================================================================
+
+# --- Сигналы и Инструкция ---
 @router.callback_query(F.data == "view_fast_signals")
 async def cb_view_fast_signals(call: CallbackQuery):
     if not await is_user_subscribed(call.from_user.id):
-        await call.answer("❌ Доступно только при активной PRO-подписке!", show_alert=True)
+        await call.answer("❌ Доступно только подписчикам PRO!", show_alert=True)
         return
 
     u = await get_user_data(call.from_user.id)
@@ -852,62 +805,58 @@ async def cb_view_fast_signals(call: CallbackQuery):
 
     if not filtered:
         text = (
-            "⚡️ <b>LIVE SCANNER | ПОИСК СВЯЗОК</b>\n"
-            "────────────────────────\n"
-            "🔍 В данный момент нет связок, подходящих под ваши фильтры.\n"
-            f"📌 Ваши параметры: Мин. спред <b>{u['min_spread']}%</b>\n\n"
-            "<i>Сканер проверяет рынок каждые 5 секунд...</i>"
+            "⚡️ <b>Поиск связок...</b>\n\n"
+            "В данный момент нет доступных арбитражных связок под ваши фильтры.\n"
+            f"<i>Текущий порог спреда: <b>{u['min_spread']}%</b></i>"
         )
     else:
-        text = "⚡️ <b>АКТУАЛЬНЫЕ МЕЖБИРЖЕВЫЕ СВЯЗКИ:</b>\n────────────────────────\n\n"
+        text = "⚡️ <b>Актуальные связки в реальном времени:</b>\n──────────────\n\n"
         for sig in filtered[:4]:
             text += (
-                f"🔹 <b>{sig['symbol']}</b> (Обновлено: <code>{sig['time']}</code>)\n"
-                f"🟢 Покупка: <a href='{sig['buy_url']}'><b>{sig['buy_ex']}</b></a> ➔ <code>{sig['buy_price']:.5f} USDT</code>\n"
-                f"🔴 Продажа: <a href='{sig['sell_url']}'><b>{sig['sell_ex']}</b></a> ➔ <code>{sig['sell_price']:.5f} USDT</code>\n"
+                f"🔹 <b>{sig['symbol']}</b> (<code>{sig['time']}</code>)\n"
+                f"🟢 Покупка: <a href='{sig['buy_url']}'><b>{sig['buy_ex']}</b></a> ➔ <code>{sig['buy_price']:.5f}</code>\n"
+                f"🔴 Продажа: <a href='{sig['sell_url']}'><b>{sig['sell_ex']}</b></a> ➔ <code>{sig['sell_price']:.5f}</code>\n"
                 f"📈 Спред: <b>+{sig['net_spread']}%</b> | Профит с $1k: <b>~${sig['est_profit']}</b>\n\n"
             )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="view_fast_signals")],
-        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu_main")]
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")]
     ])
     await call.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
 
 @router.callback_query(F.data == "menu_guide")
 async def cb_guide(call: CallbackQuery):
     text = (
-        "📖 <b>РЕГЛАМЕНТ ТОРГОВЛИ И ИНСТРУКЦИЯ</b>\n"
-        "────────────────────────\n"
-        "1. Получите сигнал в бота или VIP-канале.\n"
-        "2. Перейдите по ссылке <b>BUY</b> и купите токен на первой бирже по маркету/лимиту.\n"
-        "3. Перейдите в раздел вывода (Withdraw) и отправьте монеты на вторую биржу.\n"
-        "4. После зачисления на второй бирже нажмите <b>SELL</b> и продайте токен обратно в USDT.\n\n"
-        "⚠️ <b>ВАЖНО:</b> Всегда сверяйте статус сетей ввода/вывода (Deposit/Withdraw) перед проведением крупной сделки!"
+        "📖 <b>Как работать с арбитражными связками:</b>\n"
+        "──────────────\n"
+        "1. Выберите связку из списка сканера или VIP-канала.\n"
+        "2. Перейдите по кнопке <b>Покупка</b> и купите монету по рыночной цене.\n"
+        "3. Переведите монеты на вторую биржу (раздел Withdraw/Deposit).\n"
+        "4. Нажмите <b>Продажа</b> и продайте токен обратно в USDT.\n\n"
+        "⚠️ <i>Всегда проверяйте доступность сети перевода на обеих биржах перед сделкой!</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")]])
     await call.message.edit_text(text, reply_markup=kb)
 
-# =====================================================================
-# ОПЛАТА И ТАРИФЫ (ОПЛАТА XROCKET УДАЛЕНА)
-# =====================================================================
+
+# --- Оплата ---
 @router.callback_query(F.data == "menu_buy")
 async def cb_buy(call: CallbackQuery):
     text = (
-        "💎 <b>ВЫБОР ТАРИФА PRO ДОСТУПА</b>\n"
-        "────────────────────────\n"
-        "В стоимость входит:\n"
-        "• Мгновенный доступ к сканеру и приватным сигналам.\n"
-        "• Гибкие настройки фильтров под ваш капитал.\n"
-        "• Автоматические уведомления в закрытый VIP-канал.\n\n"
-        "📌 <b>Доступные планы:</b>\n"
-        "• <b>7 ДНЕЙ (PRO)</b> — 7.00 USDT\n"
-        "• <b>30 ДНЕЙ (VIP)</b> — 30.00 USDT\n"
+        "💎 <b>Оформление PRO доступа</b>\n"
+        "──────────────\n"
+        "Что вы получите:\n"
+        "• Мгновенные сигналы в личных сообщениях\n"
+        "• Доступ в закрытый VIP-канал\n"
+        "• Фильтры по спреду и биржам\n"
+        "• Встроенный дневник и калькулятор\n\n"
+        "<b>Выберите тариф:</b>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 7 ДНЕЙ — $7", callback_data="select_plan_week")],
-        [InlineKeyboardButton(text="💳 30 ДНЕЙ — $30", callback_data="select_plan_month")],
-        [InlineKeyboardButton(text="◀️ Отмена", callback_data="menu_main")]
+        [InlineKeyboardButton(text="PRO (7 дней) — 7.00 USDT", callback_data="select_plan_week")],
+        [InlineKeyboardButton(text="VIP (30 дней) — 30.00 USDT", callback_data="select_plan_month")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")]
     ])
     await call.message.edit_text(text, reply_markup=kb)
 
@@ -917,9 +866,8 @@ async def cb_select_plan(call: CallbackQuery):
     plan = PRICES[plan_key]
 
     invoice = await crypto_pay.create_invoice(plan["usd"], f"{call.from_user.id}:{plan_key}")
-
     if not invoice:
-        await call.answer("Ошибка генерации чека. Попробуйте позже.", show_alert=True)
+        await call.answer(" Ошибка создания чека. Попробуйте чуть позже.", show_alert=True)
         return
 
     async with aiosqlite.connect(DB_NAME) as db:
@@ -931,22 +879,20 @@ async def cb_select_plan(call: CallbackQuery):
         await db.commit()
 
     text = (
-        f"🧾 <b>СЧЕТ НА ОПЛАТУ СФОРМИРОВАН</b>\n"
-        f"────────────────────────\n"
-        f"Шлюз: <b>@CryptoBot</b>\n"
+        f"💳 <b>Оплата через @CryptoBot</b>\n"
+        f"──────────────\n"
         f"Тариф: <b>{plan['name']}</b>\n"
-        f"К оплате: <b>{plan['usd']} USDT</b>\n\n"
-        f"<i>Нажмите кнопку ниже для перехода к оплате. Подписка активируется автоматически сразу после подтверждения транзакции.</i>"
+        f"Сумма: <b>{plan['usd']} USDT</b>\n\n"
+        f"Для оплаты нажмите кнопку ниже. Подписка активируется автоматически."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🔗 ОПЛАТИТЬ {plan['usd']} USDT", url=invoice["pay_url"])],
-        [InlineKeyboardButton(text="◀️ Отмена", callback_data="menu_buy")]
+        [InlineKeyboardButton(text=f"Перейти к оплате (${plan['usd']})", url=invoice["pay_url"])],
+        [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="menu_buy")]
     ])
     await call.message.edit_text(text, reply_markup=kb)
 
-# =====================================================================
-# АДМИН-ПАНЕЛЬ
-# =====================================================================
+
+# --- Админ панель ---
 @router.callback_query(F.data == "menu_admin")
 async def cb_admin_panel(call: CallbackQuery):
     if call.from_user.id not in ADMIN_IDS:
@@ -964,22 +910,22 @@ async def cb_admin_panel(call: CallbackQuery):
             total_revenue = (await c3.fetchone())[0] or 0.0
 
     text = (
-        f"⚙️ <b>ADMIN DASHBOARD</b>\n"
-        f"────────────────────────\n"
-        f"📊 <b>Всего юзеров:</b> <code>{total_users}</code>\n"
-        f"💎 <b>Активных PRO:</b> <code>{active_subs}</code>\n"
-        f"💰 <b>Выручка:</b> <code>${total_revenue:.2f} USDT</code>\n"
-        f"💬 <b>Поддержка:</b> <code>{html.escape(support_user)}</code>\n\n"
-        f"<b>Быстрые команды:</b>\n"
-        f"• <code>/grant [ID] [Дней]</code> — Выдать доступ\n"
-        f"• <code>/revoke [ID]</code> — Забрать доступ\n"
-        f"• <code>/set_support [@username]</code> — Сменить контакт"
+        f"🛠 <b>Админ-панель</b>\n"
+        f"──────────────\n"
+        f"👥 Всего пользователей: <code>{total_users}</code>\n"
+        f"💎 Активных PRO: <code>{active_subs}</code>\n"
+        f"💰 Доход: <code>${total_revenue:.2f} USDT</code>\n"
+        f"💬 Поддержка: <code>{html.escape(support_user)}</code>\n\n"
+        f"<b>Быстрый доступ (команды):</b>\n"
+        f"• <code>/grant [ID] [Дней]</code>\n"
+        f"• <code>/revoke [ID]</code>\n"
+        f"• <code>/set_support [@username]</code>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Массовая рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="💬 Сменить аккаунт поддержки", callback_data="admin_change_support")],
-        [InlineKeyboardButton(text="📥 Экспорт базы (CSV)", callback_data="admin_export")],
-        [InlineKeyboardButton(text="◀️ В главное меню", callback_data="menu_main")]
+        [InlineKeyboardButton(text="💬 Изменить поддержку", callback_data="admin_change_support")],
+        [InlineKeyboardButton(text="📥 Выгрузить базу (CSV)", callback_data="admin_export")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_main")]
     ])
     await call.message.edit_text(text, reply_markup=kb)
 
@@ -988,7 +934,7 @@ async def cb_admin_change_sup(call: CallbackQuery, state: FSMContext):
     if call.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(Form.waiting_for_support)
-    await call.message.answer("✏️ Введите новый юзернейм поддержки (начинайте с @):")
+    await call.message.answer("✏️ Введите новый юзернейм поддержки (начиная с @):")
     await call.answer()
 
 @router.message(Form.waiting_for_support)
@@ -1000,14 +946,14 @@ async def process_support_set(message: Message, state: FSMContext):
         txt = "@" + txt
     await set_setting("support_username", txt)
     await state.clear()
-    await message.answer(f"✅ Поддержка изменена на <b>{html.escape(txt)}</b>")
+    await message.answer(f"✅ Юзернейм поддержки обновлен: <b>{html.escape(txt)}</b>")
 
 @router.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast(call: CallbackQuery, state: FSMContext):
     if call.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(Form.waiting_for_broadcast)
-    await call.message.answer("✏️ Введите текст рассылки (поддерживается HTML разметка):")
+    await call.message.answer("✏️ Введите текст рассылки (поддерживаются HTML-теги):")
     await call.answer()
 
 @router.message(Form.waiting_for_broadcast)
@@ -1024,12 +970,12 @@ async def process_broadcast(message: Message, state: FSMContext):
     sent = 0
     for (u_id,) in users:
         try:
-            await bot.send_message(u_id, f"📢 <b>ОБЪЯВЛЕНИЕ СИСТЕМЫ:</b>\n\n{txt}")
+            await bot.send_message(u_id, f"📢 <b>Сообщение от администрации:</b>\n\n{txt}")
             sent += 1
             await asyncio.sleep(0.04)
         except Exception:
             pass
-    await message.answer(f"✅ Рассылка успешно отправлена {sent} пользователям.")
+    await message.answer(f"✅ Рассылка завершена. Доставлено пользователям: {sent}")
 
 @router.callback_query(F.data == "admin_export")
 async def cb_admin_export(call: CallbackQuery):
@@ -1038,25 +984,21 @@ async def cb_admin_export(call: CallbackQuery):
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["User ID", "Username", "Subscription Expiry (UTC)", "Status"])
+    writer.writerow(["User ID", "Username", "Expiry Date (UTC)", "Status"])
 
     now_ts = int(time.time())
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id, username, sub_expiry FROM users") as cursor:
             rows = await cursor.fetchall()
             for u_id, uname, exp_ts in rows:
-                status = "Expired"
-                exp_str = "N/A"
-                if exp_ts and int(exp_ts) > 0:
-                    exp_dt = datetime.fromtimestamp(int(exp_ts), tz=timezone.utc)
-                    exp_str = exp_dt.strftime('%d.%m.%Y %H:%M UTC')
-                    if int(exp_ts) > now_ts:
-                        status = "Active"
+                parsed = parse_expiry(exp_ts)
+                exp_str = datetime.fromtimestamp(parsed, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC') if parsed > 0 else "N/A"
+                status = "Active" if parsed > now_ts else "Expired"
                 writer.writerow([u_id, uname or "N/A", exp_str, status])
 
     file_bytes = output.getvalue().encode('utf-8')
-    input_file = BufferedInputFile(file_bytes, filename="users_database.csv")
-    await call.message.answer_document(input_file, caption="📊 Полный экспорт пользователей системы.")
+    input_file = BufferedInputFile(file_bytes, filename="users_export.csv")
+    await call.message.answer_document(input_file, caption="📊 Выгрузка базы пользователей.")
     await call.answer()
 
 @router.message(Command("grant"))
@@ -1064,64 +1006,40 @@ async def cmd_grant(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            raise ValueError()
-        target_user_id = int(parts[1])
-        days = int(parts[2])
-        if days <= 0:
-            raise ValueError()
-
-        exp_ts = await add_subscription(target_user_id, days)
+        _, target_id, days = message.text.split()
+        exp_ts = await add_subscription(int(target_id), int(days))
         exp_str = datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
-        
-        await message.answer(f"✅ Выдана подписка юзеру <code>{target_user_id}</code> на {days} дн. До: <b>{exp_str}</b>")
-        try:
-            kb = await get_main_menu_kb(target_user_id, target_user_id in ADMIN_IDS)
-            await bot.send_message(
-                target_user_id,
-                f"🎉 <b>Вам активирован PRO доступ на {days} дней!</b>\n\n"
-                f"Срок действия: до <code>{exp_str}</code>",
-                reply_markup=kb
-            )
-        except Exception:
-            pass
+        await message.answer(f"✅ Подписка для <code>{target_id}</code> выдана на {days} дн. До: <b>{exp_str}</b>")
     except Exception:
-        await message.answer("❌ Формат: <code>/grant [user_id] [дней]</code>")
+        await message.answer("❌ Формат: <code>/grant [ID] [Дни]</code>")
 
 @router.message(Command("revoke"))
 async def cmd_revoke(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     try:
-        parts = message.text.split()
-        if len(parts) != 2:
-            raise ValueError()
-        target_user_id = int(parts[1])
-        await revoke_subscription(target_user_id)
-        await message.answer(f"🚫 Подписка пользователя <code>{target_user_id}</code> аннулирована.")
+        _, target_id = message.text.split()
+        await revoke_subscription(int(target_id))
+        await message.answer(f"🚫 Подписка пользователя <code>{target_id}</code> аннулирована.")
     except Exception:
-        await message.answer("❌ Формат: <code>/revoke [user_id]</code>")
+        await message.answer("❌ Формат: <code>/revoke [ID]</code>")
 
 @router.message(Command("set_support"))
 async def cmd_set_support(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     try:
-        parts = message.text.split()
-        if len(parts) != 2:
-            raise ValueError()
-        new_sup = parts[1].strip()
+        _, new_sup = message.text.split()
+        new_sup = new_sup.strip()
         if not new_sup.startswith("@"):
             new_sup = "@" + new_sup
         await set_setting("support_username", new_sup)
-        await message.answer(f"✅ Аккаунт поддержки обновлен: <b>{html.escape(new_sup)}</b>")
+        await message.answer(f"✅ Поддержка обновлена: <b>{html.escape(new_sup)}</b>")
     except Exception:
         await message.answer("❌ Формат: <code>/set_support @username</code>")
 
-# =====================================================================
-# ЗАПУСК
-# =====================================================================
+
+# --- Запуск приложения ---
 async def main():
     await init_db()
     dp.include_router(router)
@@ -1131,7 +1049,7 @@ async def main():
     asyncio.create_task(background_scanner_5s(bot, exchanges))
     asyncio.create_task(background_billing_checker(bot))
 
-    logging.info("Арбитражный сканер PRO успешно запущен...")
+    logging.info("Сканер успешно запущен...")
     try:
         await dp.start_polling(bot)
     finally:

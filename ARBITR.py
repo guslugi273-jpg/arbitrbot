@@ -1,9 +1,11 @@
 import asyncio
 import csv
+import html
 import io
 import json
 import logging
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -29,7 +31,6 @@ from aiogram.types import (
 # =====================================================================
 BOT_TOKEN = "8979491056:AAEamiXQj9EZrl34ggOaPpJphHMaqMOXcYg"
 CRYPTO_PAY_TOKEN = "640413:AAozTIOPhVCXP62brvl6Bt8kL0vp9ticohx"
-XROCKET_PAY_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhcHBJZCI6IjMwMzE5OSIsImp0aSI6ImFwcDozMDMxOTk6NWQ1Yzk0MmMtODRjMy00ZjdjLWI1ODYtMzc4Mzc3MTg3MGZmIiwiaWF0IjoxNzkwNzUzOTYxfQ.4uSC0RvbOZR7VPr_CyHZX4J_zii4yboKt3n9qfxvfHo"
 
 CHANNEL_SIGNALS_ID = -1004368321305             # ID закрытого VIP-канала
 REQUIRED_CHANNEL_ID = "@arbitrnewwws"           # Публичный ТГК для обязательной подписки
@@ -56,13 +57,13 @@ EXCHANGE_CLASSES = {
 
 DB_NAME = "bot_database.db"
 LATEST_SIGNALS: List[Dict] = []
+LAST_ALERT_TIMES: Dict[str, int] = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 
 class Form(StatesGroup):
     waiting_for_support = State()
     waiting_for_broadcast = State()
-    # FSM для добавления сделки и калькулятора
     waiting_for_trade_pair = State()
     waiting_for_trade_amount = State()
     waiting_for_trade_profit = State()
@@ -96,7 +97,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                sub_expiry TIMESTAMP,
+                sub_expiry INTEGER DEFAULT 0,
                 notified_24h INTEGER DEFAULT 0,
                 min_spread REAL DEFAULT 0.3,
                 enabled_exchanges TEXT DEFAULT '["binance","bybit","okx","gate","kucoin"]'
@@ -105,7 +106,7 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS invoices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                invoice_id TEXT,
+                invoice_id TEXT UNIQUE,
                 provider TEXT,
                 user_id INTEGER,
                 amount REAL,
@@ -119,7 +120,6 @@ async def init_db():
                 value TEXT
             )
         """)
-        # Таблица для дневника сделок
         await db.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +134,19 @@ async def init_db():
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support_username', '@support_arbitrage')")
         await db.commit()
 
+        # Автоматическая миграция подписок из ISO-строк в INTEGER (при необходимости)
+        async with db.execute("SELECT user_id, sub_expiry FROM users WHERE sub_expiry IS NOT NULL") as cursor:
+            rows = await cursor.fetchall()
+            for u_id, exp_val in rows:
+                if isinstance(exp_val, str) and not exp_val.isdigit():
+                    try:
+                        dt = datetime.fromisoformat(exp_val)
+                        ts = int(dt.timestamp())
+                        await db.execute("UPDATE users SET sub_expiry = ? WHERE user_id = ?", (ts, u_id))
+                    except Exception:
+                        await db.execute("UPDATE users SET sub_expiry = 0 WHERE user_id = ?", (u_id,))
+            await db.commit()
+
 async def get_setting(key: str, default: str = "") -> str:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
@@ -145,19 +158,31 @@ async def set_setting(key: str, value: str):
         await db.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
         await db.commit()
 
+async def get_sub_expiry(user_id: int) -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT sub_expiry FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] is not None:
+                try:
+                    return int(row[0])
+                except (ValueError, TypeError):
+                    return 0
+            return 0
+
 async def get_user_data(user_id: int) -> dict:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id, username, sub_expiry, min_spread, enabled_exchanges FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
+                sub_exp = int(row[2]) if row[2] is not None and str(row[2]).isdigit() else 0
                 return {
                     "user_id": row[0],
                     "username": row[1],
-                    "sub_expiry": row[2],
+                    "sub_expiry": sub_exp,
                     "min_spread": row[3] or 0.3,
                     "exchanges": json.loads(row[4]) if row[4] else EXCHANGE_NAMES
                 }
-            return {"user_id": user_id, "username": "User", "sub_expiry": None, "min_spread": 0.3, "exchanges": EXCHANGE_NAMES}
+            return {"user_id": user_id, "username": "User", "sub_expiry": 0, "min_spread": 0.3, "exchanges": EXCHANGE_NAMES}
 
 async def update_user(user_id: int, username: str):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -175,43 +200,29 @@ async def update_user_settings(user_id: int, min_spread: float = None, exchanges
             await db.execute("UPDATE users SET enabled_exchanges = ? WHERE user_id = ?", (json.dumps(exchanges), user_id))
         await db.commit()
 
-async def add_subscription(user_id: int, days: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT sub_expiry FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            
-        now = datetime.now()
-        if row and row[0]:
-            try:
-                current_expiry = datetime.fromisoformat(row[0])
-            except Exception:
-                current_expiry = now
-            new_expiry = (current_expiry if current_expiry > now else now) + timedelta(days=days)
-        else:
-            new_expiry = now + timedelta(days=days)
+async def add_subscription(user_id: int, days: int) -> int:
+    now = int(time.time())
+    current_expiry = await get_sub_expiry(user_id)
+    base = max(now, current_expiry)
+    new_expiry = base + (days * 86400)
 
+    async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
             INSERT INTO users (user_id, username, sub_expiry, notified_24h) 
             VALUES (?, 'User', ?, 0)
             ON CONFLICT(user_id) DO UPDATE SET sub_expiry = excluded.sub_expiry, notified_24h = 0
-        """, (user_id, new_expiry.isoformat()))
+        """, (user_id, new_expiry))
         await db.commit()
-        return new_expiry
+    return new_expiry
 
 async def revoke_subscription(user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET sub_expiry = NULL WHERE user_id = ?", (user_id,))
+        await db.execute("UPDATE users SET sub_expiry = 0 WHERE user_id = ?", (user_id,))
         await db.commit()
 
 async def is_user_subscribed(user_id: int) -> bool:
-    u = await get_user_data(user_id)
-    if u and u["sub_expiry"]:
-        try:
-            exp = datetime.fromisoformat(u["sub_expiry"])
-            return exp > datetime.now()
-        except Exception:
-            return False
-    return False
+    expiry = await get_sub_expiry(user_id)
+    return expiry > int(time.time())
 
 # =====================================================================
 # ФУНКЦИИ ДНЕВНИКА СДЕЛОК
@@ -248,7 +259,7 @@ async def get_recent_trades(user_id: int, limit: int = 5) -> list:
             return await cursor.fetchall()
 
 # =====================================================================
-# ПЛАТЕЖНЫЕ ШЛЮЗЫ: CRYPTOBOT & XROCKET
+# ПЛАТЕЖНЫЙ ШЛЮЗ: CRYPTOBOT
 # =====================================================================
 class CryptoPayAPI:
     def __init__(self, token: str):
@@ -261,7 +272,7 @@ class CryptoPayAPI:
         data = {"asset": "USDT", "amount": str(amount), "description": "PRO Access Scanner", "payload": payload}
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=self.headers, json=data) as resp:
+                async with session.post(url, headers=self.headers, json=data, timeout=10) as resp:
                     res = await resp.json()
                     if res.get("ok"):
                         return {"invoice_id": str(res["result"]["invoice_id"]), "pay_url": res["result"]["pay_url"]}
@@ -273,7 +284,7 @@ class CryptoPayAPI:
         url = f"{self.base_url}getInvoices"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.headers, params={"invoice_ids": invoice_id}) as resp:
+                async with session.get(url, headers=self.headers, params={"invoice_ids": invoice_id}, timeout=10) as resp:
                     res = await resp.json()
                     if res.get("ok") and res["result"]["items"]:
                         return res["result"]["items"][0]
@@ -281,59 +292,25 @@ class CryptoPayAPI:
             logging.error(f"CryptoPay getInvoice error: {e}")
         return None
 
-class XRocketPayAPI:
-    def __init__(self, token: str):
-        self.token = token
-        self.headers = {"Rocket-Pay-Key": self.token, "Content-Type": "application/json"}
-        self.base_url = "https://pay.xrocket.tg/"
-
-    async def create_invoice(self, amount: float, payload: str) -> Optional[Dict]:
-        url = f"{self.base_url}tg-pay/invoice"
-        data = {"amount": float(amount), "currency": "USDT", "description": "PRO Access Scanner", "numPayments": 1, "payload": payload}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=self.headers, json=data) as resp:
-                    res = await resp.json()
-                    if res.get("success") and res.get("data"):
-                        inv = res["data"]
-                        return {"invoice_id": str(inv.get("id") or inv.get("invoiceId")), "pay_url": inv.get("link") or inv.get("botPayUrl") or inv.get("url")}
-        except Exception as e:
-            logging.error(f"XRocket error: {e}")
-        return None
-
-    async def get_invoice(self, invoice_id: str) -> Optional[Dict]:
-        url = f"{self.base_url}tg-pay/invoice/{invoice_id}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.headers) as resp:
-                    res = await resp.json()
-                    if res.get("success") and res.get("data"):
-                        return res["data"]
-        except Exception as e:
-            logging.error(f"XRocket getInvoice error: {e}")
-        return None
-
 crypto_pay = CryptoPayAPI(CRYPTO_PAY_TOKEN)
-xrocket_pay = XRocketPayAPI(XROCKET_PAY_TOKEN)
 
 # =====================================================================
-# СКАНИРОВАНИЕ БИРЖ (5 сек)
+# СКАНИРОВАНИЕ БИРЖ
 # =====================================================================
-async def fetch_top_clean_coins() -> List[str]:
+async def fetch_top_clean_coins(session: aiohttp.ClientSession) -> List[str]:
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 80, "page": 1}
     clean_symbols = []
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=8) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for item in data:
-                        symbol = item.get('symbol', '').upper()
-                        coin_id = item.get('id', '').lower()
-                        name = item.get('name', '').lower()
-                        if not any(kw in coin_id or kw in name or kw == symbol.lower() for kw in MEME_KEYWORDS):
-                            clean_symbols.append(f"{symbol}/USDT")
+        async with session.get(url, params=params, timeout=8) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for item in data:
+                    symbol = item.get('symbol', '').upper()
+                    coin_id = item.get('id', '').lower()
+                    name = item.get('name', '').lower()
+                    if not any(kw in coin_id or kw in name or kw == symbol.lower() for kw in MEME_KEYWORDS):
+                        clean_symbols.append(f"{symbol}/USDT")
     except Exception as e:
         logging.error(f"CoinGecko error: {e}")
     return clean_symbols or ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "ADA/USDT", "AVAX/USDT", "NEAR/USDT", "SUI/USDT", "APT/USDT"]
@@ -345,9 +322,9 @@ async def fetch_exchange_tickers(ex_name: str, ex_obj) -> Optional[Dict]:
     except Exception:
         return None
 
-async def scan_market_5s(exchanges: Dict) -> List[Dict]:
+async def scan_market_5s(exchanges: Dict, session: aiohttp.ClientSession) -> List[Dict]:
     global LATEST_SIGNALS
-    target_coins = set(await fetch_top_clean_coins())
+    target_coins = set(await fetch_top_clean_coins(session))
     
     tasks = [fetch_exchange_tickers(name, ex) for name, ex in exchanges.items()]
     results = await asyncio.gather(*tasks)
@@ -361,6 +338,8 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
         return []
 
     signals = []
+    now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    
     for symbol in target_coins:
         coin_prices = {}
         for ex_name, tickers in all_tickers.items():
@@ -392,7 +371,7 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
                     'gross_spread': round(gross_spread, 2),
                     'net_spread': round(net_spread, 2),
                     'est_profit': est_profit_1k,
-                    'time': datetime.now().strftime("%H:%M:%S")
+                    'time': now_utc
                 })
 
     LATEST_SIGNALS = signals
@@ -402,37 +381,42 @@ async def scan_market_5s(exchanges: Dict) -> List[Dict]:
 # ФОНОВЫЕ ЗАДАЧИ
 # =====================================================================
 async def background_scanner_5s(bot: Bot, exchanges: Dict):
-    while True:
-        try:
-            signals = await scan_market_5s(exchanges)
-            for sig in signals:
-                if sig['net_spread'] >= 0.40:
-                    text = (
-                        f"🚨 <b>ARBITRAGE ALERT | {sig['symbol']}</b>\n"
-                        f"────────────────────────\n"
-                        f"🟢 <b>BUY:</b> <a href='{sig['buy_url']}'>{sig['buy_ex']}</a> ➔ <code>{sig['buy_price']:.5f} USDT</code>\n"
-                        f"🔴 <b>SELL:</b> <a href='{sig['sell_url']}'>{sig['sell_ex']}</a> ➔ <code>{sig['sell_price']:.5f} USDT</code>\n"
-                        f"────────────────────────\n"
-                        f"📈 <b>Чистый спред:</b> <code>+{sig['net_spread']}%</code>\n"
-                        f"💵 <b>Профит с $1,000:</b> <code>~${sig['est_profit']} USDT</code>\n"
-                        f"⏱ <b>Время:</b> <code>{sig['time']} UTC</code>\n"
-                        f"🌐 <b>Сеть вывода:</b> <code>AVAILABLE [TRC20/ERC20]</code>"
-                    )
-                    kb = InlineKeyboardMarkup(inline_keyboard=[
-                        [
-                            InlineKeyboardButton(text=f"🟢 Купить на {sig['buy_ex']}", url=sig['buy_url']),
-                            InlineKeyboardButton(text=f"🔴 Продать на {sig['sell_ex']}", url=sig['sell_url'])
-                        ]
-                    ])
-                    await bot.send_message(CHANNEL_SIGNALS_ID, text, reply_markup=kb, disable_web_page_preview=True)
-        except Exception as e:
-            logging.error(f"Scanner background error: {e}")
-        await asyncio.sleep(5)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                signals = await scan_market_5s(exchanges, session)
+                now_ts = int(time.time())
+                for sig in signals:
+                    symbol = sig['symbol']
+                    # Кулдаун 120 сек на повторные алерты по одной паре
+                    if sig['net_spread'] >= 0.40 and (now_ts - LAST_ALERT_TIMES.get(symbol, 0) > 120):
+                        LAST_ALERT_TIMES[symbol] = now_ts
+                        text = (
+                            f"🚨 <b>ARBITRAGE ALERT | {sig['symbol']}</b>\n"
+                            f"────────────────────────\n"
+                            f"🟢 <b>BUY:</b> <a href='{sig['buy_url']}'>{sig['buy_ex']}</a> ➔ <code>{sig['buy_price']:.5f} USDT</code>\n"
+                            f"🔴 <b>SELL:</b> <a href='{sig['sell_url']}'>{sig['sell_ex']}</a> ➔ <code>{sig['sell_price']:.5f} USDT</code>\n"
+                            f"────────────────────────\n"
+                            f"📈 <b>Чистый спред:</b> <code>+{sig['net_spread']}%</code>\n"
+                            f"💵 <b>Профит с $1,000:</b> <code>~${sig['est_profit']} USDT</code>\n"
+                            f"⏱ <b>Время:</b> <code>{sig['time']} UTC</code>\n"
+                            f"🌐 <b>Сеть вывода:</b> <code>AVAILABLE [TRC20/ERC20]</code>"
+                        )
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [
+                                InlineKeyboardButton(text=f"🟢 Купить на {sig['buy_ex']}", url=sig['buy_url']),
+                                InlineKeyboardButton(text=f"🔴 Продать на {sig['sell_ex']}", url=sig['sell_url'])
+                            ]
+                        ])
+                        await bot.send_message(CHANNEL_SIGNALS_ID, text, reply_markup=kb, disable_web_page_preview=True)
+            except Exception as e:
+                logging.error(f"Scanner background error: {e}")
+            await asyncio.sleep(5)
 
 async def background_billing_checker(bot: Bot):
     while True:
         try:
-            now = datetime.now()
+            now_ts = int(time.time())
             async with aiosqlite.connect(DB_NAME) as db:
                 async with db.execute("SELECT id, invoice_id, provider, user_id, plan FROM invoices WHERE status = 'active'") as cursor:
                     invoices = await cursor.fetchall()
@@ -443,41 +427,43 @@ async def background_billing_checker(bot: Bot):
                         inv = await crypto_pay.get_invoice(inv_id)
                         if inv and inv.get("status") == "paid":
                             is_paid = True
-                    elif provider == "xrocket":
-                        inv = await xrocket_pay.get_invoice(inv_id)
-                        if inv and str(inv.get("status", "")).upper() in ["PAID", "COMPLETED"]:
-                            is_paid = True
 
                     if is_paid:
-                        exp_date = await add_subscription(u_id, PRICES[plan]["days"])
-                        await db.execute("UPDATE invoices SET status = 'paid' WHERE id = ?", (row_id,))
+                        # Атомарно меняем статус, чтобы исключить начисление дважды
+                        cursor_upd = await db.execute("UPDATE invoices SET status = 'paid' WHERE id = ? AND status = 'active'", (row_id,))
                         await db.commit()
                         
-                        is_admin = u_id in ADMIN_IDS
-                        kb = await get_main_menu_kb(u_id, is_admin)
-                        await bot.send_message(
-                            u_id,
-                            f"✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА!</b>\n\n"
-                            f"Активирован тариф: <b>{PRICES[plan]['name']}</b>\n"
-                            f"Срок действия до: <code>{exp_date.strftime('%d.%m.%Y %H:%M')}</code>\n\n"
-                            f"🔓 Все фильтры, быстрые сигналы и VIP-канал открыты.",
-                            reply_markup=kb
-                        )
+                        if cursor_upd.rowcount > 0:
+                            new_exp_ts = await add_subscription(u_id, PRICES[plan]["days"])
+                            exp_dt_str = datetime.fromtimestamp(new_exp_ts, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
+                            
+                            is_admin = u_id in ADMIN_IDS
+                            kb = await get_main_menu_kb(u_id, is_admin)
+                            try:
+                                await bot.send_message(
+                                    u_id,
+                                    f"✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА!</b>\n\n"
+                                    f"Активирован тариф: <b>{PRICES[plan]['name']}</b>\n"
+                                    f"Срок действия до: <code>{exp_dt_str}</code>\n\n"
+                                    f"🔓 Все фильтры, быстрые сигналы и VIP-канал открыты.",
+                                    reply_markup=kb
+                                )
+                            except Exception:
+                                pass
 
-                # Уведомления за 24ч
-                target_time = now + timedelta(hours=24)
-                async with db.execute("SELECT user_id, sub_expiry FROM users WHERE notified_24h = 0 AND sub_expiry IS NOT NULL") as cursor:
+                # Уведомления за 24 часа
+                target_time = now_ts + 86400
+                async with db.execute("SELECT user_id, sub_expiry FROM users WHERE notified_24h = 0 AND sub_expiry > ?", (now_ts,)) as cursor:
                     users = await cursor.fetchall()
 
-                for u_id, exp_str in users:
-                    try:
-                        exp_dt = datetime.fromisoformat(exp_str)
-                        if now < exp_dt <= target_time:
-                            await bot.send_message(u_id, "⚠️ <b>ВНИМАНИЕ!</b> До окончания вашей PRO-подписки осталось 24 часа. Продлите доступ, чтобы не потерять сигналы.")
+                for u_id, exp_ts in users:
+                    if exp_ts and now_ts < exp_ts <= target_time:
+                        try:
+                            await bot.send_message(u_id, "⚠️ <b>ВНИМАНИЕ!</b> До окончания вашей PRO-подписки осталось менее 24 часов. Продлите доступ, чтобы не потерять сигналы.")
                             await db.execute("UPDATE users SET notified_24h = 1 WHERE user_id = ?", (u_id,))
                             await db.commit()
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
         except Exception as e:
             logging.error(f"Billing Error: {e}")
         await asyncio.sleep(10)
@@ -588,23 +574,22 @@ async def cb_profile(call: CallbackQuery):
     u = await get_user_data(call.from_user.id)
     stats = await get_user_trade_stats(call.from_user.id)
     
-    sub_badge = "🔴 НЕ АКТИВНА"
-    exp_info = "Отсутствует"
+    now_ts = int(time.time())
+    exp_ts = u.get("sub_expiry", 0)
     
-    if u["sub_expiry"]:
-        try:
-            exp = datetime.fromisoformat(u["sub_expiry"])
-            if exp > datetime.now():
-                sub_badge = "🟢 PRO VIP"
-                exp_info = exp.strftime('%d.%m.%Y %H:%M')
-        except Exception:
-            pass
+    if exp_ts > now_ts:
+        sub_badge = "🟢 PRO VIP"
+        exp_info = datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
+    else:
+        sub_badge = "🔴 НЕ АКТИВНА"
+        exp_info = "Отсутствует"
 
+    username_safe = html.escape(call.from_user.username or 'не задан')
     text = (
         f"👤 <b>ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ</b>\n"
         f"────────────────────────\n"
         f"🆔 <b>ID:</b> <code>{call.from_user.id}</code>\n"
-        f"👤 <b>Юзернейм:</b> @{call.from_user.username or 'не задан'}\n"
+        f"👤 <b>Юзернейм:</b> @{username_safe}\n"
         f"💎 <b>Статус подписки:</b> {sub_badge}\n"
         f"⏳ <b>Действительна до:</b> <code>{exp_info}</code>\n"
         f"⚙️ <b>Мин. спред:</b> <code>{u['min_spread']}%</code>\n\n"
@@ -630,7 +615,7 @@ async def cb_trades_menu(call: CallbackQuery, state: FSMContext):
     if recent:
         history_text = "\n<b>📜 ПОСЛЕДНИЕ СДЕЛКИ:</b>\n"
         for p_info, amt, prof, roi, dt in recent:
-            history_text += f"• <code>{p_info}</code> | Вход: <b>${amt}</b> | Профит: <b>+${prof} (+{roi}%)</b>\n"
+            history_text += f"• <code>{html.escape(str(p_info))}</code> | Вход: <b>${amt}</b> | Профит: <b>+${prof} (+{roi}%)</b>\n"
 
     text = (
         f"📊 <b>ДНЕВНИК СДЕЛОК И КАЛЬКУЛЯТОР</b>\n"
@@ -657,7 +642,7 @@ async def cb_trade_add_start(call: CallbackQuery, state: FSMContext):
     text = (
         "➕ <b>ДОБАВЛЕНИЕ СДЕЛКИ (Шаг 1/3)</b>\n"
         "────────────────────────\n"
-        "Введите парную инфомацию или название монеты и бирж.\n\n"
+        "Введите парную информацию или название монеты и бирж.\n\n"
         "<i>Пример: <code>SOL Binance -> Bybit</code> или <code>BTC/USDT</code></i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu_trades")]])
@@ -710,7 +695,7 @@ async def process_trade_profit(message: Message, state: FSMContext):
         text = (
             "✅ <b>СДЕЛКА УСПЕШНО СОХРАНЕНА!</b>\n"
             "────────────────────────\n"
-            f"📌 Пара/Биржи: <b>{data['pair_info']}</b>\n"
+            f"📌 Пара/Биржи: <b>{html.escape(data['pair_info'])}</b>\n"
             f"💵 Депозит: <b>${data['amount_usd']} USDT</b>\n"
             f"📈 Чистый профит: <b>+${prof} USDT (+{roi}%)</b>\n\n"
             "Данные внесены в ваш личный профиль и дневник!"
@@ -749,9 +734,12 @@ async def process_calc_input(message: Message, state: FSMContext):
         buy_p = float(parts[1])
         sell_p = float(parts[2])
         
+        if capital <= 0 or buy_p <= 0 or sell_p <= 0:
+            raise ValueError()
+
         # Расчет
-        coins_bought = (capital * 0.999) / buy_p  # минус 0.1% торговая комиссия
-        usd_received = (coins_bought * sell_p) * 0.999 # минус 0.1% торговая комиссия
+        coins_bought = (capital * 0.999) / buy_p  
+        usd_received = (coins_bought * sell_p) * 0.999 
         
         net_profit = round(usd_received - capital, 2)
         roi = round((net_profit / capital * 100), 2)
@@ -776,7 +764,7 @@ async def process_calc_input(message: Message, state: FSMContext):
         ])
         await message.answer(text, reply_markup=kb)
     except Exception:
-        await message.answer("❌ Неверный формат! Введите 3 числа через пробел.\n<i>Пример: 1000 65000 65800</i>")
+        await message.answer("❌ Неверный формат! Введите 3 положительных числа через пробел.\n<i>Пример: 1000 65000 65800</i>")
 
 @router.callback_query(F.data == "trade_history")
 async def cb_trade_history(call: CallbackQuery):
@@ -786,7 +774,7 @@ async def cb_trade_history(call: CallbackQuery):
     else:
         text = "📜 <b>ПОЛНАЯ ИСТОРИЯ СДЕЛОК (Последние 15)</b>\n────────────────────────\n\n"
         for p_info, amt, prof, roi, dt in trades:
-            text += f"🔹 <b>{p_info}</b>\n   Депозит: ${amt} | Профит: <b>+${prof} USDT (+{roi}%)</b>\n\n"
+            text += f"🔹 <b>{html.escape(str(p_info))}</b>\n   Депозит: ${amt} | Профит: <b>+${prof} USDT (+{roi}%)</b>\n\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="menu_trades")]])
     await call.message.edit_text(text, reply_markup=kb)
@@ -901,7 +889,7 @@ async def cb_guide(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb)
 
 # =====================================================================
-# ОПЛАТА И ТАРИФЫ
+# ОПЛАТА И ТАРИФЫ (ОПЛАТА XROCKET УДАЛЕНА)
 # =====================================================================
 @router.callback_query(F.data == "menu_buy")
 async def cb_buy(call: CallbackQuery):
@@ -924,34 +912,11 @@ async def cb_buy(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb)
 
 @router.callback_query(F.data.startswith("select_plan_"))
-async def cb_select_gateway(call: CallbackQuery):
+async def cb_select_plan(call: CallbackQuery):
     plan_key = call.data.replace("select_plan_", "")
     plan = PRICES[plan_key]
 
-    text = (
-        f"💳 <b>ОФОРМЛЕНИЕ ПОДПИСКИ: {plan['name']}</b>\n"
-        f"────────────────────────\n"
-        f"Сумма к оплате: <b>{plan['usd']} USDT</b>\n\n"
-        f"Выберите платежную систему для моментального зачисления:"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤖 CryptoBot (@CryptoBot)", callback_data=f"pay_cryptobot_{plan_key}")],
-        [InlineKeyboardButton(text="🚀 xRocket (@xrocket)", callback_data=f"pay_xrocket_{plan_key}")],
-        [InlineKeyboardButton(text="◀ Назад", callback_data="menu_buy")]
-    ])
-    await call.message.edit_text(text, reply_markup=kb)
-
-@router.callback_query(F.data.startswith("pay_"))
-async def cb_pay_process(call: CallbackQuery):
-    parts = call.data.split("_")
-    provider, plan_key = parts[1], parts[2]
-    plan = PRICES[plan_key]
-
-    invoice = None
-    if provider == "cryptobot":
-        invoice = await crypto_pay.create_invoice(plan["usd"], f"{call.from_user.id}:{plan_key}")
-    elif provider == "xrocket":
-        invoice = await xrocket_pay.create_invoice(plan["usd"], f"{call.from_user.id}:{plan_key}")
+    invoice = await crypto_pay.create_invoice(plan["usd"], f"{call.from_user.id}:{plan_key}")
 
     if not invoice:
         await call.answer("Ошибка генерации чека. Попробуйте позже.", show_alert=True)
@@ -959,19 +924,19 @@ async def cb_pay_process(call: CallbackQuery):
 
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
-            "INSERT INTO invoices (invoice_id, provider, user_id, amount, plan) VALUES (?, ?, ?, ?, ?)",
-            (invoice["invoice_id"], provider, call.from_user.id, plan["usd"], plan_key)
+            "INSERT INTO invoices (invoice_id, provider, user_id, amount, plan) VALUES (?, 'cryptobot', ?, ?, ?)"
+            " ON CONFLICT(invoice_id) DO NOTHING",
+            (invoice["invoice_id"], call.from_user.id, plan["usd"], plan_key)
         )
         await db.commit()
 
-    provider_name = "@CryptoBot" if provider == "cryptobot" else "@xrocket"
     text = (
         f"🧾 <b>СЧЕТ НА ОПЛАТУ СФОРМИРОВАН</b>\n"
         f"────────────────────────\n"
-        f"Шлюз: <b>{provider_name}</b>\n"
+        f"Шлюз: <b>@CryptoBot</b>\n"
         f"Тариф: <b>{plan['name']}</b>\n"
         f"К оплате: <b>{plan['usd']} USDT</b>\n\n"
-        f"<i>Нажмите кнопку ниже для перехода к оплате. Подписка активируется автоматически после подтверждения транзакции.</i>"
+        f"<i>Нажмите кнопку ниже для перехода к оплате. Подписка активируется автоматически сразу после подтверждения транзакции.</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🔗 ОПЛАТИТЬ {plan['usd']} USDT", url=invoice["pay_url"])],
@@ -988,11 +953,12 @@ async def cb_admin_panel(call: CallbackQuery):
         return
 
     support_user = await get_setting("support_username", "@support_arbitrage")
+    now_ts = int(time.time())
+    
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT COUNT(*) FROM users") as c1:
             total_users = (await c1.fetchone())[0]
-        now = datetime.now().isoformat()
-        async with db.execute("SELECT COUNT(*) FROM users WHERE sub_expiry > ?", (now,)) as c2:
+        async with db.execute("SELECT COUNT(*) FROM users WHERE sub_expiry > ?", (now_ts,)) as c2:
             active_subs = (await c2.fetchone())[0]
         async with db.execute("SELECT SUM(amount) FROM invoices WHERE status = 'paid'") as c3:
             total_revenue = (await c3.fetchone())[0] or 0.0
@@ -1003,7 +969,7 @@ async def cb_admin_panel(call: CallbackQuery):
         f"📊 <b>Всего юзеров:</b> <code>{total_users}</code>\n"
         f"💎 <b>Активных PRO:</b> <code>{active_subs}</code>\n"
         f"💰 <b>Выручка:</b> <code>${total_revenue:.2f} USDT</code>\n"
-        f"💬 <b>Поддержка:</b> <code>{support_user}</code>\n\n"
+        f"💬 <b>Поддержка:</b> <code>{html.escape(support_user)}</code>\n\n"
         f"<b>Быстрые команды:</b>\n"
         f"• <code>/grant [ID] [Дней]</code> — Выдать доступ\n"
         f"• <code>/revoke [ID]</code> — Забрать доступ\n"
@@ -1034,7 +1000,7 @@ async def process_support_set(message: Message, state: FSMContext):
         txt = "@" + txt
     await set_setting("support_username", txt)
     await state.clear()
-    await message.answer(f"✅ Поддержка изменена на <b>{txt}</b>")
+    await message.answer(f"✅ Поддержка изменена на <b>{html.escape(txt)}</b>")
 
 @router.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast(call: CallbackQuery, state: FSMContext):
@@ -1072,21 +1038,21 @@ async def cb_admin_export(call: CallbackQuery):
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["User ID", "Username", "Subscription Expiry", "Status"])
+    writer.writerow(["User ID", "Username", "Subscription Expiry (UTC)", "Status"])
 
+    now_ts = int(time.time())
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id, username, sub_expiry FROM users") as cursor:
             rows = await cursor.fetchall()
-            now = datetime.now()
-            for u_id, uname, exp_str in rows:
+            for u_id, uname, exp_ts in rows:
                 status = "Expired"
-                if exp_str:
-                    try:
-                        if datetime.fromisoformat(exp_str) > now:
-                            status = "Active"
-                    except Exception:
-                        pass
-                writer.writerow([u_id, uname, exp_str or "N/A", status])
+                exp_str = "N/A"
+                if exp_ts and int(exp_ts) > 0:
+                    exp_dt = datetime.fromtimestamp(int(exp_ts), tz=timezone.utc)
+                    exp_str = exp_dt.strftime('%d.%m.%Y %H:%M UTC')
+                    if int(exp_ts) > now_ts:
+                        status = "Active"
+                writer.writerow([u_id, uname or "N/A", exp_str, status])
 
     file_bytes = output.getvalue().encode('utf-8')
     input_file = BufferedInputFile(file_bytes, filename="users_database.csv")
@@ -1098,16 +1064,24 @@ async def cmd_grant(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     try:
-        _, target_id, days = message.text.split()
-        target_user_id = int(target_id)
-        exp = await add_subscription(target_user_id, int(days))
-        await message.answer(f"✅ Выдана подписка юзеру <code>{target_user_id}</code> на {days} дн. До: {exp.strftime('%d.%m.%Y %H:%M')}")
+        parts = message.text.split()
+        if len(parts) != 3:
+            raise ValueError()
+        target_user_id = int(parts[1])
+        days = int(parts[2])
+        if days <= 0:
+            raise ValueError()
+
+        exp_ts = await add_subscription(target_user_id, days)
+        exp_str = datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
+        
+        await message.answer(f"✅ Выдана подписка юзеру <code>{target_user_id}</code> на {days} дн. До: <b>{exp_str}</b>")
         try:
             kb = await get_main_menu_kb(target_user_id, target_user_id in ADMIN_IDS)
             await bot.send_message(
                 target_user_id,
                 f"🎉 <b>Вам активирован PRO доступ на {days} дней!</b>\n\n"
-                f"Срок действия: до <code>{exp.strftime('%d.%m.%Y %H:%M')}</code>",
+                f"Срок действия: до <code>{exp_str}</code>",
                 reply_markup=kb
             )
         except Exception:
@@ -1120,9 +1094,12 @@ async def cmd_revoke(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     try:
-        _, target_id = message.text.split()
-        await revoke_subscription(int(target_id))
-        await message.answer(f"🚫 Подписка пользователя <code>{target_id}</code> аннулирована.")
+        parts = message.text.split()
+        if len(parts) != 2:
+            raise ValueError()
+        target_user_id = int(parts[1])
+        await revoke_subscription(target_user_id)
+        await message.answer(f"🚫 Подписка пользователя <code>{target_user_id}</code> аннулирована.")
     except Exception:
         await message.answer("❌ Формат: <code>/revoke [user_id]</code>")
 
@@ -1131,11 +1108,14 @@ async def cmd_set_support(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     try:
-        _, new_sup = message.text.split()
+        parts = message.text.split()
+        if len(parts) != 2:
+            raise ValueError()
+        new_sup = parts[1].strip()
         if not new_sup.startswith("@"):
             new_sup = "@" + new_sup
         await set_setting("support_username", new_sup)
-        await message.answer(f"✅ Аккаунт поддержки обновлен: <b>{new_sup}</b>")
+        await message.answer(f"✅ Аккаунт поддержки обновлен: <b>{html.escape(new_sup)}</b>")
     except Exception:
         await message.answer("❌ Формат: <code>/set_support @username</code>")
 
